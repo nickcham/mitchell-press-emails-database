@@ -1,14 +1,18 @@
 <#
 .SYNOPSIS
-    M365 Mailbox Email Exporter — interactive menu with Full, Incremental, and Attachment modes.
+    M365 Mailbox Email Exporter — interactive menu with Full, Incremental, and Attachment download modes.
 
 .DESCRIPTION
     Connects to Microsoft Graph API and exports emails from Inbox and Sent Items
-    into a SQLite database. Offers three operating modes via an interactive menu:
+    into a SQLite database. Offers four operating modes via an interactive menu:
 
-    1) Full Export         — wipes and re-downloads every email
-    2) Incremental Sync   — only fetches new/changed emails since last run
-    3) Incremental + Attachments — same as #2, plus downloads attachments to disk
+    1) Full Export                — wipes and re-downloads every email
+    2) Incremental Sync          — only fetches new/changed emails since last run
+    3) Download Missing Attachments — scans DB for emails not yet downloaded, fetches attachments to disk
+    Q) Quit
+
+    Email sync and attachment downloading are separate operations. Emails are marked
+    with an attachments_downloaded flag so option 3 only fetches what's missing.
 
 .PARAMETER DatabasePath
     Path to the SQLite database file. Created if it doesn't exist.
@@ -69,8 +73,8 @@ function Show-Menu {
     Write-Host "  [2] Incremental Sync" -ForegroundColor White
     Write-Host "      Download only new/changed emails since last run" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  [3] Incremental Sync + Download Attachments" -ForegroundColor White
-    Write-Host "      Same as #2, plus save attachments to disk" -ForegroundColor DarkGray
+    Write-Host "  [3] Download Missing Attachments" -ForegroundColor White
+    Write-Host "      Scan DB and download attachments not yet saved to disk" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [Q] Quit" -ForegroundColor Yellow
     Write-Host ""
@@ -117,31 +121,32 @@ function Connect-ToGraph {
 function Initialize-Database {
     $createEmailsTable = @"
 CREATE TABLE IF NOT EXISTS emails (
-    message_id          TEXT PRIMARY KEY,
-    conversation_id     TEXT,
-    subject             TEXT,
-    from_name           TEXT,
-    from_address        TEXT,
-    to_recipients       TEXT,
-    cc_recipients       TEXT,
-    bcc_recipients      TEXT,
-    reply_to            TEXT,
-    sent_datetime       TEXT,
-    received_datetime   TEXT,
-    has_attachments     INTEGER,
-    importance          TEXT,
-    is_read             INTEGER,
-    is_draft            INTEGER,
-    body_content_type   TEXT,
-    body_content        TEXT,
-    body_preview        TEXT,
-    web_link            TEXT,
-    folder              TEXT,
-    categories          TEXT,
-    internet_message_id TEXT,
-    parent_folder_id    TEXT,
-    created_datetime    TEXT,
-    last_modified       TEXT
+    message_id              TEXT PRIMARY KEY,
+    conversation_id         TEXT,
+    subject                 TEXT,
+    from_name               TEXT,
+    from_address            TEXT,
+    to_recipients           TEXT,
+    cc_recipients           TEXT,
+    bcc_recipients          TEXT,
+    reply_to                TEXT,
+    sent_datetime           TEXT,
+    received_datetime       TEXT,
+    has_attachments         INTEGER,
+    attachments_downloaded  INTEGER DEFAULT 0,
+    importance              TEXT,
+    is_read                 INTEGER,
+    is_draft                INTEGER,
+    body_content_type       TEXT,
+    body_content            TEXT,
+    body_preview            TEXT,
+    web_link                TEXT,
+    folder                  TEXT,
+    categories              TEXT,
+    internet_message_id     TEXT,
+    parent_folder_id        TEXT,
+    created_datetime        TEXT,
+    last_modified           TEXT
 );
 "@
 
@@ -171,6 +176,15 @@ CREATE TABLE IF NOT EXISTS sync_log (
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createEmailsTable
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createAttachmentsTable
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createSyncTable
+
+    # Add attachments_downloaded column to existing databases that lack it
+    try {
+        Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+            "ALTER TABLE emails ADD COLUMN attachments_downloaded INTEGER DEFAULT 0;"
+    } catch {
+        # Column already exists — ignore
+    }
+
     Write-Host "Database ready: $($script:DatabasePath)"
 }
 
@@ -188,7 +202,7 @@ function Format-Recipients {
 function Get-LastSyncTime {
     param([string]$Folder)
     $result = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
-        "SELECT MAX(completed_at) AS last_sync FROM sync_log WHERE folder = @folder" `
+        "SELECT MAX(completed_at) AS last_sync FROM sync_log WHERE folder = @folder AND sync_type IN ('full','incremental')" `
         -SqlParameters @{ folder = $Folder }
     if ($result.last_sync) { return $result.last_sync }
     return $null
@@ -210,7 +224,6 @@ function Get-Emails {
     $url = "https://graph.microsoft.com/v1.0/$BasePath/mailFolders/$graphFolder/messages"
     $url += "?`$top=100&`$select=$fields"
 
-    # For incremental: only fetch emails modified after last sync
     if ($SinceDateTime) {
         $filter = "lastModifiedDateTime ge $SinceDateTime"
         $url += "&`$filter=$filter"
@@ -277,88 +290,161 @@ function Save-Email {
         last_modified       = $Mail.lastModifiedDateTime
     }
 
+    # Preserve existing attachments_downloaded flag if the row already exists
     $upsertSQL = @"
-INSERT OR REPLACE INTO emails (
+INSERT INTO emails (
     message_id, conversation_id, subject, from_name, from_address,
     to_recipients, cc_recipients, bcc_recipients, reply_to,
-    sent_datetime, received_datetime, has_attachments, importance,
-    is_read, is_draft, body_content_type, body_content, body_preview,
+    sent_datetime, received_datetime, has_attachments, attachments_downloaded,
+    importance, is_read, is_draft, body_content_type, body_content, body_preview,
     web_link, folder, categories, internet_message_id,
     parent_folder_id, created_datetime, last_modified
 ) VALUES (
     @message_id, @conversation_id, @subject, @from_name, @from_address,
     @to_recipients, @cc_recipients, @bcc_recipients, @reply_to,
-    @sent_datetime, @received_datetime, @has_attachments, @importance,
-    @is_read, @is_draft, @body_content_type, @body_content, @body_preview,
+    @sent_datetime, @received_datetime, @has_attachments,
+    COALESCE((SELECT attachments_downloaded FROM emails WHERE message_id = @message_id), 0),
+    @importance, @is_read, @is_draft, @body_content_type, @body_content, @body_preview,
     @web_link, @folder, @categories, @internet_message_id,
     @parent_folder_id, @created_datetime, @last_modified
-);
+)
+ON CONFLICT(message_id) DO UPDATE SET
+    conversation_id     = excluded.conversation_id,
+    subject             = excluded.subject,
+    from_name           = excluded.from_name,
+    from_address        = excluded.from_address,
+    to_recipients       = excluded.to_recipients,
+    cc_recipients       = excluded.cc_recipients,
+    bcc_recipients      = excluded.bcc_recipients,
+    reply_to            = excluded.reply_to,
+    sent_datetime       = excluded.sent_datetime,
+    received_datetime   = excluded.received_datetime,
+    has_attachments     = excluded.has_attachments,
+    importance          = excluded.importance,
+    is_read             = excluded.is_read,
+    is_draft            = excluded.is_draft,
+    body_content_type   = excluded.body_content_type,
+    body_content        = excluded.body_content,
+    body_preview        = excluded.body_preview,
+    web_link            = excluded.web_link,
+    folder              = excluded.folder,
+    categories          = excluded.categories,
+    internet_message_id = excluded.internet_message_id,
+    parent_folder_id    = excluded.parent_folder_id,
+    created_datetime    = excluded.created_datetime,
+    last_modified       = excluded.last_modified;
 "@
 
     Invoke-SqliteQuery -DataSource $DbPath -Query $upsertSQL -SqlParameters $params
 }
 
 # ===================================================================
-# DOWNLOAD ATTACHMENTS
+# DOWNLOAD MISSING ATTACHMENTS (standalone operation)
 # ===================================================================
-function Save-Attachments {
-    param(
-        [object]$Mail,
-        [string]$BasePath,
-        [string]$DbPath,
-        [string]$AttachFolder
-    )
+function Invoke-DownloadMissingAttachments {
+    # Find emails that have attachments but haven't been downloaded yet
+    $pending = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+        "SELECT message_id, subject FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0"
 
-    if (-not $Mail.hasAttachments) { return }
+    if (-not $pending -or $pending.Count -eq 0) {
+        Write-Host "`nNo missing attachments found. All caught up!" -ForegroundColor Green
+        return
+    }
 
-    $url = "https://graph.microsoft.com/v1.0/$BasePath/messages/$($Mail.id)/attachments"
-    $response = Invoke-MgGraphRequest -Method GET -Uri $url
+    Write-Host "`nFound $($pending.Count) email(s) with attachments to download." -ForegroundColor Cyan
 
-    foreach ($att in $response.value) {
-        # Skip inline images / reference attachments without content
-        if ($att.'@odata.type' -eq '#microsoft.graph.referenceAttachment') { continue }
-        if (-not $att.contentBytes) { continue }
+    # Ensure attachment folder exists
+    if (-not (Test-Path $script:AttachmentPath)) {
+        New-Item -Path $script:AttachmentPath -ItemType Directory -Force | Out-Null
+    }
+    Write-Host "Saving to: $($script:AttachmentPath)" -ForegroundColor Cyan
 
-        # Build safe filename: <message_id_short>_<original_filename>
-        $safeMessageId = ($Mail.id -replace '[^a-zA-Z0-9]', '')[0..19] -join ''
-        $safeFilename  = $att.name -replace '[\\/:*?"<>|]', '_'
-        $diskFilename  = "${safeMessageId}_${safeFilename}"
-        $diskFullPath  = Join-Path $AttachFolder $diskFilename
+    $downloaded = 0
+    $fileCount = 0
+    $errors = 0
 
-        # Save file to disk
-        $bytes = [Convert]::FromBase64String($att.contentBytes)
-        [System.IO.File]::WriteAllBytes($diskFullPath, $bytes)
-
-        # Record in database
-        $attParams = @{
-            id           = $att.id
-            message_id   = $Mail.id
-            filename     = $att.name
-            content_type = $att.contentType
-            size_bytes   = $att.size
-            disk_path    = $diskFullPath
+    foreach ($row in $pending) {
+        $downloaded++
+        $msgId = $row.message_id
+        $subj  = $row.subject
+        if ($downloaded % 10 -eq 0 -or $downloaded -eq $pending.Count) {
+            Write-Host "  Processing $downloaded / $($pending.Count) ..." -ForegroundColor DarkGray
         }
 
-        $attSQL = @"
+        try {
+            $url = "https://graph.microsoft.com/v1.0/$($script:basePath)/messages/$msgId/attachments"
+            $response = Invoke-MgGraphRequest -Method GET -Uri $url
+
+            foreach ($att in $response.value) {
+                # Skip reference attachments and items without content
+                if ($att.'@odata.type' -eq '#microsoft.graph.referenceAttachment') { continue }
+                if (-not $att.contentBytes) { continue }
+
+                # Build safe filename: <message_id_short>_<original_filename>
+                $safeMessageId = ($msgId -replace '[^a-zA-Z0-9]', '')[0..19] -join ''
+                $safeFilename  = $att.name -replace '[\\/:*?"<>|]', '_'
+                $diskFilename  = "${safeMessageId}_${safeFilename}"
+                $diskFullPath  = Join-Path $script:AttachmentPath $diskFilename
+
+                # Save file to disk
+                $bytes = [Convert]::FromBase64String($att.contentBytes)
+                [System.IO.File]::WriteAllBytes($diskFullPath, $bytes)
+
+                # Record in attachments table
+                $attParams = @{
+                    id           = $att.id
+                    message_id   = $msgId
+                    filename     = $att.name
+                    content_type = $att.contentType
+                    size_bytes   = $att.size
+                    disk_path    = $diskFullPath
+                }
+
+                $attSQL = @"
 INSERT OR REPLACE INTO attachments (id, message_id, filename, content_type, size_bytes, disk_path)
 VALUES (@id, @message_id, @filename, @content_type, @size_bytes, @disk_path);
 "@
-        Invoke-SqliteQuery -DataSource $DbPath -Query $attSQL -SqlParameters $attParams
+                Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $attSQL -SqlParameters $attParams
+                $fileCount++
+            }
+
+            # Mark this email as downloaded
+            Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+                "UPDATE emails SET attachments_downloaded = 1 WHERE message_id = @mid;" `
+                -SqlParameters @{ mid = $msgId }
+
+        } catch {
+            $errors++
+            Write-Host "    ERROR on '$subj': $($_.Exception.Message)" -ForegroundColor Red
+        }
     }
+
+    # Summary
+    $totalPending = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+        "SELECT COUNT(*) AS cnt FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0").cnt
+
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Green
+    Write-Host "   ATTACHMENT DOWNLOAD COMPLETE" -ForegroundColor Green
+    Write-Host "============================================" -ForegroundColor Green
+    Write-Host "  Emails processed:    $downloaded"
+    Write-Host "  Files saved:         $fileCount"
+    Write-Host "  Errors:              $errors"
+    Write-Host "  Still pending:       $totalPending"
+    Write-Host "  Attachment folder:   $($script:AttachmentPath)"
+    Write-Host ""
 }
 
 # ===================================================================
-# SYNC ENGINE
+# EMAIL SYNC ENGINE
 # ===================================================================
 function Invoke-Sync {
     param(
-        [string]$Mode  # "full", "incremental", "incremental+attachments"
+        [string]$Mode  # "full" or "incremental"
     )
 
     $folders = @("Inbox", "SentItems")
     $totalCount = 0
-    $totalAttachments = 0
-    $downloadAttachments = ($Mode -eq "incremental+attachments")
 
     # For full export, wipe existing data
     if ($Mode -eq "full") {
@@ -366,14 +452,6 @@ function Invoke-Sync {
         Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "DELETE FROM attachments;"
         Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "DELETE FROM emails;"
         Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "DELETE FROM sync_log;"
-    }
-
-    # Ensure attachment folder exists
-    if ($downloadAttachments) {
-        if (-not (Test-Path $script:AttachmentPath)) {
-            New-Item -Path $script:AttachmentPath -ItemType Directory -Force | Out-Null
-        }
-        Write-Host "Attachments will be saved to: $($script:AttachmentPath)" -ForegroundColor Cyan
     }
 
     foreach ($folder in $folders) {
@@ -396,11 +474,6 @@ function Invoke-Sync {
                 Write-Host "    Processing $i / $($emails.Count) ..." -ForegroundColor DarkGray
             }
             Save-Email -Mail $mail -Folder $folder -DbPath $script:DatabasePath
-
-            if ($downloadAttachments -and $mail.hasAttachments) {
-                Save-Attachments -Mail $mail -BasePath $script:basePath -DbPath $script:DatabasePath -AttachFolder $script:AttachmentPath
-                $totalAttachments++
-            }
         }
 
         # Log the sync
@@ -422,7 +495,8 @@ function Invoke-Sync {
 
     # Summary
     $dbEmailCount = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails").cnt
-    $dbAttachCount = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM attachments").cnt
+    $pendingAttach = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+        "SELECT COUNT(*) AS cnt FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0").cnt
 
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Green
@@ -431,10 +505,9 @@ function Invoke-Sync {
     Write-Host "  Mode:                $Mode"
     Write-Host "  Emails processed:    $totalCount"
     Write-Host "  Total in database:   $dbEmailCount"
-    Write-Host "  Attachments in DB:   $dbAttachCount"
     Write-Host "  Database file:       $($script:DatabasePath)"
-    if ($downloadAttachments) {
-        Write-Host "  Attachment folder:   $($script:AttachmentPath)"
+    if ($pendingAttach -gt 0) {
+        Write-Host "  Attachments pending: $pendingAttach (use option 3 to download)" -ForegroundColor Yellow
     }
     Write-Host ""
 }
@@ -452,7 +525,7 @@ while ($running) {
     switch ($choice) {
         "1" { Invoke-Sync -Mode "full" }
         "2" { Invoke-Sync -Mode "incremental" }
-        "3" { Invoke-Sync -Mode "incremental+attachments" }
+        "3" { Invoke-DownloadMissingAttachments }
         "Q" { $running = $false }
         "q" { $running = $false }
         default {
