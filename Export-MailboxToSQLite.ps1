@@ -639,11 +639,11 @@ function Remove-QuotedContent {
     for ($j = 0; $j -lt $lines.Count; $j++) {
         $line = $lines[$j].Trim()
         # Common Outlook quote markers
-        if ($line -match '^-{2,}\s*(Original Message|Forwarded message)' -or
-            $line -match '^From:\s+.+@' -and $j -gt 0 -and $lines[$j-1].Trim() -match '^(Sent|Date):' -or
-            $line -match '^_{10,}' -or
-            $line -match '^\s*On .+ wrote:\s*$' -or
-            $line -match '^>{2,}') {
+        if (($line -match '^-{2,}\s*(Original Message|Forwarded message)') -or
+            ($line -match '^From:\s+.+@' -and $j -gt 0 -and $lines[$j-1].Trim() -match '^(Sent|Date):') -or
+            ($line -match '^_{10,}') -or
+            ($line -match '^\s*On .+ wrote:\s*$') -or
+            ($line -match '^>{2,}')) {
             $cutIndex = $j
             break
         }

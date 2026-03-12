@@ -83,6 +83,10 @@ This means you can sync emails first (option 1 or 2), then come back later and d
 ### 4 — Build Conversations (Full)
 Reads every email in the database and groups them by `conversation_id` into the `conversations` table. Each row contains the full chronological thread as clean text — this is the table AI uses for KB lookups. No Graph API calls needed; it works entirely from local data.
 
+The `full_thread` column is processed for AI/RAG quality:
+- **HTML stripping** — `<style>` and `<script>` blocks are removed entirely, block-level tags (`<p>`, `<div>`, `<br>`) are converted to line breaks, all remaining tags are stripped, and HTML entities (`&amp;`, `&nbsp;`, `&quot;`, numeric entities, etc.) are decoded. Paragraph structure is preserved rather than collapsing everything to a single line.
+- **Quote deduplication** — each email's body is trimmed at the point where quoted/forwarded content begins (e.g. "--- Original Message ---", "On ... wrote:", `>>>` markers, Outlook's `From:/Sent:` header blocks). This prevents the same content appearing multiple times in the thread and reduces token count for AI consumption.
+
 ### 5 — Build Conversations (Incremental)
 Only rebuilds conversations where an email's `last_modified` timestamp is newer than the conversation's `last_built` timestamp. Fast for keeping the conversations table current after an incremental email sync.
 
