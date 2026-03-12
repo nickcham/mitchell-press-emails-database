@@ -1,20 +1,20 @@
 # mitchell-press-emails-database
 
-PowerShell script that exports every email from an M365 mailbox (Inbox + Sent Items) into a SQLite database, with an interactive menu for full export, incremental sync, and standalone attachment downloading.
+PowerShell script that exports every email from an M365 mailbox (Inbox + Sent Items) into CSV files, with an interactive menu for full export, incremental sync, conversation threading, and standalone attachment downloading.
 
 ## Prerequisites
 
 - **PowerShell 7+** (or Windows PowerShell 5.1)
-- The following modules are auto-installed on first run:
-  - `Microsoft.Graph.Authentication`
-  - `PSSQLite`
+- `Microsoft.Graph.Authentication` module (auto-installed on first run)
+
+No other external modules required — uses built-in `Export-Csv`/`Import-Csv`.
 
 ## Usage
 
 ### Quick start — interactive browser login (with MFA)
 
 ```powershell
-.\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db"
+.\Export-MailboxToCSV.ps1
 ```
 
 That's it. A browser window opens, you sign in with your Microsoft 365 account, complete MFA if prompted, and the script runs against your mailbox. No app registration needed.
@@ -23,31 +23,34 @@ The interactive menu then appears:
 
 ```
 ============================================
-   M365 Mailbox Email Exporter
+   M365 Mailbox Email Exporter (CSV)
 ============================================
 
   [1] Full Export
-      Download ALL emails (first run or full re-scan)
+      Download ALL emails (overwrites existing CSVs)
 
   [2] Incremental Sync
-      Download only new/changed emails since last run
+      Download only new/changed since last run
 
   [3] Download Missing Attachments
-      Scan DB and download attachments not yet saved to disk
+      Scan CSVs and download missing attachments
 
   [4] Build Conversations (Full)
-      Rebuild conversations table from all emails in DB
+      Rebuild conversations.csv from all emails
 
   [5] Build Conversations (Incremental)
-      Update only conversations with new/changed emails
+      Update changed conversations only
+
+  [6] Status & Quick Notes
+      Show stats, sync history, custom app guide
 
   [Q] Quit
 ```
 
-### Custom attachment folder
+### Custom output and attachment folders
 
 ```powershell
-.\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db" -AttachmentPath "D:\EmailAttachments"
+.\Export-MailboxToCSV.ps1 -OutputPath ".\my-export" -AttachmentPath "D:\EmailAttachments"
 ```
 
 ### App-only auth (optional — for unattended/service scenarios)
@@ -55,142 +58,129 @@ The interactive menu then appears:
 If you need to run this without a user present, set up an [Azure AD App Registration](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) with `Mail.Read` (application) permission + admin consent, then:
 
 ```powershell
-.\Export-MailboxToSQLite.ps1 `
-    -DatabasePath ".\emails.db" `
+.\Export-MailboxToCSV.ps1 `
     -ClientId "your-client-id" `
     -TenantId "your-tenant-id" `
     -ClientSecret "your-client-secret" `
     -UserEmail "user@yourdomain.com"
 ```
 
+## Output Files
+
+All files are written to the output folder (default: `.\data\`):
+
+| File | Description |
+|---|---|
+| `emails_inbox.csv` | All Inbox emails |
+| `emails_sent.csv` | All Sent Items emails |
+| `conversations.csv` | Threaded conversations for AI/KB consumption |
+| `sync_log.csv` | Sync history log |
+
+CSVs open directly in Excel, PowerBI, or any data tool.
+
 ## Menu Options
 
 ### 1 — Full Export
-Downloads every email from Inbox and Sent Items and upserts into the database. Use this for the first run or a complete re-scan. Existing data is updated, not deleted — your `attachments_downloaded` flags and attachment files are preserved.
+Downloads every email from Inbox and Sent Items and writes to CSV. Use this for the first run or a complete re-scan. Overwrites existing CSVs.
 
 ### 2 — Incremental Sync
-Uses the `lastModifiedDateTime` from the previous sync to only fetch emails that are new or changed. Fast for daily/scheduled runs.
+Uses the `lastModifiedDateTime` from the previous sync to only fetch emails that are new or changed. Existing rows are merged — updated emails are replaced while preserving `attachments_downloaded` flags. New emails are appended.
 
 ### 3 — Download Missing Attachments
 A **separate, standalone operation** that:
-1. Scans the database for emails where `has_attachments = 1 AND attachments_downloaded = 0`
+1. Scans both email CSVs for rows where `has_attachments = 1` and `attachments_downloaded = 0`
 2. Downloads each attachment from Graph API to disk
-3. Records the file path in the `attachments` table
-4. Marks the email's `attachments_downloaded` flag to `1`
+3. Marks the email's `attachments_downloaded` flag to `1` in the CSV
 
-This means you can sync emails first (option 1 or 2), then come back later and download attachments at your own pace. Re-running option 3 will only fetch what's still missing.
+Re-running option 3 will only fetch what's still missing.
 
 ### 4 — Build Conversations (Full)
-Reads every email in the database and groups them by `conversation_id` into the `conversations` table. Each row contains the full chronological thread as clean text — this is the table AI uses for KB lookups. No Graph API calls needed; it works entirely from local data.
+Reads every email from both CSVs and groups them by `conversation_id` into `conversations.csv`. Each row contains the full chronological thread as clean text — this is the file AI uses for KB lookups. No Graph API calls needed; it works entirely from local data.
 
 The `full_thread` column is processed for AI/RAG quality:
 - **HTML stripping** — `<style>` and `<script>` blocks are removed entirely, block-level tags (`<p>`, `<div>`, `<br>`) are converted to line breaks, all remaining tags are stripped, and HTML entities (`&amp;`, `&nbsp;`, `&quot;`, numeric entities, etc.) are decoded. Paragraph structure is preserved rather than collapsing everything to a single line.
 - **Quote deduplication** — each email's body is trimmed at the point where quoted/forwarded content begins (e.g. "--- Original Message ---", "On ... wrote:", `>>>` markers, Outlook's `From:/Sent:` header blocks). This prevents the same content appearing multiple times in the thread and reduces token count for AI consumption.
 
 ### 5 — Build Conversations (Incremental)
-Only rebuilds conversations where an email's `last_modified` timestamp is newer than the conversation's `last_built` timestamp. Fast for keeping the conversations table current after an incremental email sync.
+Only rebuilds conversations where an email's `last_modified` timestamp is newer than the conversation's `last_built` timestamp. Fast for keeping conversations current after an incremental email sync.
 
-## Database Schema
+### 6 — Status & Quick Notes
+Shows email/conversation counts, last sync times, auth info, and a quick guide for setting up a custom Azure AD app registration.
 
-### `emails` table
+## CSV Columns
 
-| Column | Type | Description |
-|---|---|---|
-| `message_id` | TEXT (PK) | Graph API message ID |
-| `conversation_id` | TEXT | Conversation thread ID |
-| `subject` | TEXT | Email subject line |
-| `from_name` | TEXT | Sender display name |
-| `from_address` | TEXT | Sender email address |
-| `to_recipients` | TEXT | To recipients (semicolon-separated) |
-| `cc_recipients` | TEXT | CC recipients |
-| `bcc_recipients` | TEXT | BCC recipients |
-| `reply_to` | TEXT | Reply-to addresses |
-| `sent_datetime` | TEXT | When the email was sent (ISO 8601) |
-| `received_datetime` | TEXT | When the email was received (ISO 8601) |
-| `has_attachments` | INTEGER | 1 if email has attachments |
-| `attachments_downloaded` | INTEGER | 1 if attachments have been saved to disk |
-| `importance` | TEXT | low / normal / high |
-| `is_read` | INTEGER | 1 if read |
-| `is_draft` | INTEGER | 1 if draft |
-| `body_content_type` | TEXT | html or text |
-| `body_content` | TEXT | Full email body |
-| `body_preview` | TEXT | Short body preview |
-| `web_link` | TEXT | Outlook web link to the email |
-| `folder` | TEXT | Source folder (Inbox / SentItems) |
-| `categories` | TEXT | Outlook categories |
-| `internet_message_id` | TEXT | RFC 2822 Message-ID header |
-| `parent_folder_id` | TEXT | Graph folder ID |
-| `created_datetime` | TEXT | When created in mailbox |
-| `last_modified` | TEXT | Last modified timestamp |
+### Email CSVs (`emails_inbox.csv` / `emails_sent.csv`)
 
-### `attachments` table
+| Column | Description |
+|---|---|
+| `message_id` | Graph API message ID (unique key) |
+| `conversation_id` | Conversation thread ID |
+| `subject` | Email subject line |
+| `from_name` | Sender display name |
+| `from_address` | Sender email address |
+| `to_recipients` | To recipients (semicolon-separated) |
+| `cc_recipients` | CC recipients |
+| `bcc_recipients` | BCC recipients |
+| `reply_to` | Reply-to addresses |
+| `sent_datetime` | When the email was sent (ISO 8601) |
+| `received_datetime` | When the email was received (ISO 8601) |
+| `has_attachments` | 1 if email has attachments |
+| `attachments_downloaded` | 1 if attachments have been saved to disk |
+| `importance` | low / normal / high |
+| `is_read` | 1 if read |
+| `is_draft` | 1 if draft |
+| `body_content_type` | html or text |
+| `body_content` | Full email body (raw) |
+| `body_preview` | Short body preview |
+| `cleaned_body` | HTML-stripped, quote-deduplicated body text |
+| `web_link` | Outlook web link to the email |
+| `folder` | Source folder (Inbox / SentItems) |
+| `categories` | Outlook categories |
+| `internet_message_id` | RFC 2822 Message-ID header |
+| `parent_folder_id` | Graph folder ID |
+| `created_datetime` | When created in mailbox |
+| `last_modified` | Last modified timestamp |
 
-| Column | Type | Description |
-|---|---|---|
-| `id` | TEXT (PK) | Graph attachment ID |
-| `message_id` | TEXT (FK) | References `emails.message_id` |
-| `filename` | TEXT | Original filename |
-| `content_type` | TEXT | MIME type (e.g. application/pdf) |
-| `size_bytes` | INTEGER | File size in bytes |
-| `disk_path` | TEXT | Full path to saved file on disk |
+### Conversations CSV (`conversations.csv`)
 
-### `conversations` table (AI / KB)
+| Column | Description |
+|---|---|
+| `conversation_id` | Graph conversation thread ID |
+| `subject` | Subject from the first email in the thread |
+| `participants` | All unique email addresses (semicolon-separated) |
+| `message_count` | Number of emails in the conversation |
+| `has_attachments` | 1 if any email in the thread has attachments |
+| `first_message_datetime` | Earliest email in the thread |
+| `last_message_datetime` | Most recent email in the thread |
+| `full_thread` | Complete conversation as clean text (HTML stripped, chronological) |
+| `outlook_link` | Outlook web link to the most recent email |
+| `last_built` | When this conversation row was last rebuilt |
 
-| Column | Type | Description |
-|---|---|---|
-| `conversation_id` | TEXT (PK) | Graph conversation thread ID |
-| `subject` | TEXT | Subject from the first email in the thread |
-| `participants` | TEXT | All unique email addresses (semicolon-separated) |
-| `message_count` | INTEGER | Number of emails in the conversation |
-| `has_attachments` | INTEGER | 1 if any email in the thread has attachments |
-| `first_message_datetime` | TEXT | Earliest email in the thread |
-| `last_message_datetime` | TEXT | Most recent email in the thread |
-| `full_thread` | TEXT | Complete conversation as clean text (HTML stripped, chronological) |
-| `outlook_link` | TEXT | Outlook web link to the most recent email (for manual review) |
-| `last_built` | TEXT | When this conversation row was last rebuilt |
-| **AI First-Pass Triage** | | |
-| `ai_category` | TEXT | AI-assigned category: `fact`, `how-to`, `info`, `kb`, `rubber-stamp`, `not-relevant` |
-| `ai_confidence` | TEXT | AI confidence level: `low`, `medium`, `high` |
-| `ai_summary` | TEXT | AI comment on what the conversation is about and why it may be worth preserving |
-| `ai_review_datetime` | TEXT | When AI first-pass review was performed |
-| **AI Second-Pass Confirmation** | | |
-| `ai_kb_confirmed` | INTEGER | 1 = confirmed for KB/RAG, 0 = rejected, NULL = not yet reviewed |
-| `ai_kb_confirm_datetime` | TEXT | When AI second-pass confirmation was performed |
-| `ai_kb_confirm_notes` | TEXT | AI notes on final KB decision (what to document, how to structure) |
+### Sync Log CSV (`sync_log.csv`)
 
-### `sync_log` table
+| Column | Description |
+|---|---|
+| `sync_type` | full / incremental |
+| `folder` | Inbox or SentItems |
+| `started_at` | Sync start time (UTC) |
+| `completed_at` | Sync end time (UTC) |
+| `emails_synced` | Number of emails processed |
 
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER (PK) | Auto-increment |
-| `sync_type` | TEXT | full / incremental |
-| `folder` | TEXT | Inbox or SentItems |
-| `started_at` | TEXT | Sync start time (UTC) |
-| `completed_at` | TEXT | Sync end time (UTC) |
-| `emails_synced` | INTEGER | Number of emails processed |
-
-## Querying the Database
+## Querying with PowerShell
 
 ```powershell
-Import-Module PSSQLite
-
-# Recent emails
-Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT subject, from_address, sent_datetime FROM emails ORDER BY sent_datetime DESC LIMIT 10"
+# Recent inbox emails
+Import-Csv .\data\emails_inbox.csv | Sort-Object sent_datetime -Descending | Select-Object -First 10 subject, from_address, sent_datetime
 
 # Emails with attachments still pending download
-Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT subject, from_address FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0"
+Import-Csv .\data\emails_inbox.csv | Where-Object { $_.has_attachments -eq "1" -and $_.attachments_downloaded -eq "0" } | Select-Object subject, from_address
 
-# Downloaded attachments and their paths
-Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT e.subject, a.filename, a.disk_path FROM emails e JOIN attachments a ON e.message_id = a.message_id"
-
-# Search conversations (AI/KB table)
-Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT subject, participants, message_count, last_message_datetime FROM conversations ORDER BY last_message_datetime DESC LIMIT 10"
+# Search conversations
+Import-Csv .\data\conversations.csv | Where-Object { $_.subject -like '*project update*' } | Select-Object subject, participants, message_count
 
 # Full thread text for a conversation
-Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT full_thread FROM conversations WHERE subject LIKE '%project update%'"
+(Import-Csv .\data\conversations.csv | Where-Object { $_.subject -like '*project update*' }).full_thread
 
 # Sync history
-Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT * FROM sync_log ORDER BY completed_at DESC"
+Import-Csv .\data\sync_log.csv | Sort-Object completed_at -Descending
 ```
-
-Or use any SQLite tool (DB Browser for SQLite, `sqlite3` CLI, DBeaver, etc.).
