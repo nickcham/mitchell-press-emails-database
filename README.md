@@ -27,7 +27,7 @@ The interactive menu then appears:
 ============================================
 
   [1] Full Export
-      Wipe database and download ALL emails
+      Download ALL emails (first run or full re-scan)
 
   [2] Incremental Sync
       Download only new/changed emails since last run
@@ -60,7 +60,7 @@ If you need to run this without a user present, set up an [Azure AD App Registra
 ## Menu Options
 
 ### 1 — Full Export
-Deletes all existing data and re-downloads every email from Inbox and Sent Items. Use this for first-time setup or a clean reset.
+Downloads every email from Inbox and Sent Items and upserts into the database. Use this for the first run or a complete re-scan. Existing data is updated, not deleted — your `attachments_downloaded` flags and attachment files are preserved.
 
 ### 2 — Incremental Sync
 Uses the `lastModifiedDateTime` from the previous sync to only fetch emails that are new or changed. Fast for daily/scheduled runs.

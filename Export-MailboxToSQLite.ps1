@@ -7,7 +7,7 @@
     then exports emails from Inbox and Sent Items into a SQLite database.
 
     Menu options:
-    1) Full Export                — wipes and re-downloads every email
+    1) Full Export                — downloads every email (first run or full re-scan)
     2) Incremental Sync          — only fetches new/changed emails since last run
     3) Download Missing Attachments — scans DB for emails not yet downloaded, fetches to disk
     Q) Quit
@@ -81,7 +81,7 @@ function Show-Menu {
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  [1] Full Export" -ForegroundColor White
-    Write-Host "      Wipe database and download ALL emails" -ForegroundColor DarkGray
+    Write-Host "      Download ALL emails (first run or full re-scan)" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [2] Incremental Sync" -ForegroundColor White
     Write-Host "      Download only new/changed emails since last run" -ForegroundColor DarkGray
@@ -406,10 +406,11 @@ function Invoke-DownloadMissingAttachments {
                 if ($att.'@odata.type' -eq '#microsoft.graph.referenceAttachment') { continue }
                 if (-not $att.contentBytes) { continue }
 
-                # Build safe filename: <message_id_short>_<original_filename>
-                $safeMessageId = ($msgId -replace '[^a-zA-Z0-9]', '')[0..19] -join ''
-                $safeFilename  = $att.name -replace '[\\/:*?"<>|]', '_'
-                $diskFilename  = "${safeMessageId}_${safeFilename}"
+                # Build safe filename: <attachment_id_short>_<original_filename>
+                # Uses attachment ID (not message ID) so multiple attachments per email don't collide
+                $safeAttId    = ($att.id -replace '[^a-zA-Z0-9]', '')[0..19] -join ''
+                $safeFilename = $att.name -replace '[\\/:*?"<>|]', '_'
+                $diskFilename = "${safeAttId}_${safeFilename}"
                 $diskFullPath  = Join-Path $script:AttachmentPath $diskFilename
 
                 # Save file to disk
@@ -471,14 +472,6 @@ function Invoke-Sync {
 
     $folders = @("Inbox", "SentItems")
     $totalCount = 0
-
-    # For full export, wipe existing data
-    if ($Mode -eq "full") {
-        Write-Host "`nWiping existing data for full export..." -ForegroundColor Yellow
-        Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "DELETE FROM attachments;"
-        Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "DELETE FROM emails;"
-        Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "DELETE FROM sync_log;"
-    }
 
     foreach ($folder in $folders) {
         Write-Host "`n--- Processing: $folder ---" -ForegroundColor Cyan
