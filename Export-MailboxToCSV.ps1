@@ -237,13 +237,15 @@ function Remove-QuotedContent {
 }
 
 # ===================================================================
-# FETCH EMAILS (supports incremental filter + 429 throttling)
+# FETCH + WRITE PAGE-BY-PAGE (writes to disk after every 100 emails)
 # ===================================================================
-function Get-Emails {
+function Invoke-FetchAndWrite {
     param(
         [string]$FolderName,
         [string]$BasePath,
-        [string]$SinceDateTime
+        [string]$SinceDateTime,
+        [string]$CsvPath,
+        [string]$Mode
     )
 
     $fields = 'id,conversationId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,sentDateTime,receivedDateTime,hasAttachments,importance,isRead,isDraft,body,bodyPreview,uniqueBody,webLink,categories,internetMessageId,parentFolderId,createdDateTime,lastModifiedDateTime'
@@ -258,16 +260,30 @@ function Get-Emails {
 
     $url += "&`$orderby=lastModifiedDateTime asc"
 
-    $allMessages = @()
+    # For incremental mode, load existing rows into a hashtable for merge
+    $existingById = @{}
+    if ($Mode -ne "full" -and (Test-Path $CsvPath)) {
+        $existingRows = @(Import-Csv $CsvPath)
+        foreach ($r in $existingRows) { $existingById[$r.message_id] = $r }
+        Write-Host "  Loaded $($existingById.Count) existing rows for merge." -ForegroundColor DarkGray
+    }
+
+    # For full mode, delete existing file so first page creates fresh
+    if ($Mode -eq "full" -and (Test-Path $CsvPath)) {
+        Remove-Item $CsvPath -Force
+    }
+
     $pageCount = 0
+    $totalWritten = 0
 
     while ($url) {
         $pageCount++
         Write-Host "  Fetching $FolderName page $pageCount ..." -ForegroundColor Cyan
 
+        $messages = $null
         try {
             $response = Invoke-MgGraphRequest -Method GET -Uri $url -ErrorAction Stop
-            if ($response.value) { $allMessages += $response.value }
+            $messages = $response.value
             $url = $response.'@odata.nextLink'
         } catch {
             if ($_.Exception.Response.StatusCode -eq 429) {
@@ -281,10 +297,47 @@ function Get-Emails {
             throw
         }
 
+        if (-not $messages -or $messages.Count -eq 0) {
+            Start-Sleep -Milliseconds (Get-Random -Minimum 700 -Maximum 1500)
+            continue
+        }
+
+        # Convert this page to row objects
+        $pageRows = @()
+        foreach ($mail in $messages) {
+            $pageRows += Convert-MailToRow -Mail $mail -Folder $FolderName
+        }
+
+        if ($Mode -eq "full") {
+            # Full: append each page directly to CSV
+            $isFirstPage = -not (Test-Path $CsvPath)
+            if ($isFirstPage) {
+                $pageRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+            } else {
+                $pageRows | Export-Csv -Path $CsvPath -Append -NoTypeInformation -Encoding UTF8
+            }
+        }
+        else {
+            # Incremental: update the in-memory hashtable, then flush to disk
+            foreach ($r in $pageRows) {
+                if ($existingById.ContainsKey($r.message_id)) {
+                    # Preserve attachments_downloaded flag
+                    $r.attachments_downloaded = $existingById[$r.message_id].attachments_downloaded
+                }
+                $existingById[$r.message_id] = $r
+            }
+            # Write full merged set to disk after each page
+            $existingById.Values | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+        }
+
+        $totalWritten += $pageRows.Count
+        $fileSize = if (Test-Path $CsvPath) { [math]::Round((Get-Item $CsvPath).Length / 1KB, 1) } else { 0 }
+        Write-Host "    Wrote page $pageCount ($($pageRows.Count) emails) -> $CsvPath ($($fileSize) KB on disk, $totalWritten total)" -ForegroundColor Green
+
         Start-Sleep -Milliseconds (Get-Random -Minimum 700 -Maximum 1500)
     }
 
-    return $allMessages
+    return $totalWritten
 }
 
 # ===================================================================
@@ -334,7 +387,7 @@ function Convert-MailToRow {
 }
 
 # ===================================================================
-# EMAIL SYNC ENGINE
+# EMAIL SYNC ENGINE — writes to disk after every page, not at the end
 # ===================================================================
 function Invoke-Sync {
     param([string]$Mode)
@@ -352,66 +405,9 @@ function Invoke-Sync {
             $sinceDateTime = Get-LastSyncTime -Folder $folder
         }
 
-        $emails = Get-Emails -FolderName $folder -BasePath $script:basePath -SinceDateTime $sinceDateTime
-        Write-Host "  Found $($emails.Count) emails to process." -ForegroundColor White
-
-        if ($emails.Count -eq 0) {
-            $totalCount += 0
-            Write-Host "  Done: $folder (0 emails)" -ForegroundColor Green
-            continue
-        }
-
-        # Convert all fetched emails to row objects
-        $rows = @()
-        $i = 0
-        foreach ($mail in $emails) {
-            $i++
-            if ($i % 50 -eq 0 -or $i -eq $emails.Count) {
-                Write-Host "    Processing $i / $($emails.Count) ..." -ForegroundColor DarkGray
-            }
-            $rows += Convert-MailToRow -Mail $mail -Folder $folder
-        }
-
-        if ($Mode -eq "full") {
-            # Full: overwrite the CSV
-            $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-        }
-        else {
-            # Incremental: load existing, merge by message_id, re-export
-            $existing = @{}
-            $existingRows = @()
-            if (Test-Path $csvPath) {
-                $existingRows = @(Import-Csv $csvPath)
-                foreach ($r in $existingRows) { $existing[$r.message_id] = $true }
-            }
-
-            # Separate new vs updated
-            $newRows = @()
-            $updatedIds = @{}
-            foreach ($r in $rows) {
-                if ($existing.ContainsKey($r.message_id)) {
-                    $updatedIds[$r.message_id] = $r
-                } else {
-                    $newRows += $r
-                }
-            }
-
-            # Rebuild: keep existing rows (replacing updated ones), add new
-            $merged = @()
-            foreach ($r in $existingRows) {
-                if ($updatedIds.ContainsKey($r.message_id)) {
-                    $updated = $updatedIds[$r.message_id]
-                    # Preserve attachments_downloaded flag from existing row
-                    $updated.attachments_downloaded = $r.attachments_downloaded
-                    $merged += $updated
-                } else {
-                    $merged += $r
-                }
-            }
-            $merged += $newRows
-
-            $merged | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-        }
+        # Fetch and write page-by-page — data hits disk after every 100 emails
+        $count = Invoke-FetchAndWrite -FolderName $folder -BasePath $script:basePath `
+            -SinceDateTime $sinceDateTime -CsvPath $csvPath -Mode $Mode
 
         # Log the sync
         $syncEnd = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -420,16 +416,16 @@ function Invoke-Sync {
             folder        = $folder
             started_at    = $syncStart
             completed_at  = $syncEnd
-            emails_synced = $emails.Count
+            emails_synced = $count
         } | Export-Csv -Path $script:SyncLogCsv -Append -NoTypeInformation -Encoding UTF8
 
-        $totalCount += $emails.Count
-        Write-Host "  Done: $folder ($($emails.Count) emails)" -ForegroundColor Green
+        $totalCount += $count
+        Write-Host "  Done: $folder ($count emails)" -ForegroundColor Green
     }
 
     # Summary
-    $inboxCount = if (Test-Path $script:InboxCsv) { @(Import-Csv $script:InboxCsv).Count } else { 0 }
-    $sentCount  = if (Test-Path $script:SentCsv)  { @(Import-Csv $script:SentCsv).Count  } else { 0 }
+    $inboxSize = if (Test-Path $script:InboxCsv) { [math]::Round((Get-Item $script:InboxCsv).Length / 1KB, 1) } else { 0 }
+    $sentSize  = if (Test-Path $script:SentCsv)  { [math]::Round((Get-Item $script:SentCsv).Length / 1KB, 1)  } else { 0 }
 
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Green
@@ -437,8 +433,8 @@ function Invoke-Sync {
     Write-Host "============================================" -ForegroundColor Green
     Write-Host "  Mode:              $Mode"
     Write-Host "  Emails processed:  $totalCount"
-    Write-Host "  Inbox CSV:         $inboxCount emails"
-    Write-Host "  Sent CSV:          $sentCount emails"
+    Write-Host "  Inbox CSV:         $($script:InboxCsv) ($inboxSize KB)"
+    Write-Host "  Sent CSV:          $($script:SentCsv) ($sentSize KB)"
     Write-Host "  Output folder:     $($script:OutputPath)"
     Write-Host ""
 }
