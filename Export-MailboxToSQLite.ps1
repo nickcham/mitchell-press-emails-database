@@ -5,6 +5,7 @@
 .DESCRIPTION
     Connects to Microsoft Graph via interactive browser login (supports MFA),
     then exports emails from Inbox and Sent Items into a SQLite database.
+    Auto-creates the database folder (default: .\data\) if it doesn't exist.
 
     Menu options:
     1) Full Export                — downloads every email (first run or full re-scan)
@@ -44,17 +45,21 @@
     (Optional) Target mailbox email address. Required for app-only auth.
 
 .EXAMPLE
-    # Simple — browser login with MFA (most common)
-    .\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db"
+    # Simple — browser login with MFA, default DB path (.\data\emails.db)
+    .\Export-MailboxToSQLite.ps1
+
+.EXAMPLE
+    # Custom DB path
+    .\Export-MailboxToSQLite.ps1 -DatabasePath ".\my-emails.db"
 
 .EXAMPLE
     # App-only (unattended, client credentials)
-    .\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db" -ClientId "abc" -TenantId "xyz" -ClientSecret "secret" -UserEmail "user@domain.com"
+    .\Export-MailboxToSQLite.ps1 -ClientId "abc" -TenantId "xyz" -ClientSecret "secret" -UserEmail "user@domain.com"
 #>
 
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$DatabasePath,
+    [Parameter(Mandatory = $false)]
+    [string]$DatabasePath = ".\data\emails.db",
 
     [Parameter(Mandatory = $false)]
     [string]$AttachmentPath = ".\Attachments",
@@ -73,6 +78,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Auto-create database folder if it doesn't exist
+$dbFolder = Split-Path $DatabasePath -Parent
+if ($dbFolder -and -not (Test-Path $dbFolder)) {
+    New-Item -Path $dbFolder -ItemType Directory -Force | Out-Null
+    Write-Host "Created folder: $dbFolder" -ForegroundColor Green
+}
 
 # ===================================================================
 # MENU
