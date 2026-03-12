@@ -238,12 +238,35 @@ CREATE TABLE IF NOT EXISTS conversations (
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createConversationsTable
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createSyncTable
 
-    # Add attachments_downloaded column to existing databases that lack it
-    try {
-        Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
-            "ALTER TABLE emails ADD COLUMN attachments_downloaded INTEGER DEFAULT 0;"
-    } catch {
-        # Column already exists — ignore
+    # Migrate existing databases — add columns that may not exist yet
+    $migrations = @(
+        "ALTER TABLE emails ADD COLUMN attachments_downloaded INTEGER DEFAULT 0;",
+        "ALTER TABLE conversations ADD COLUMN outlook_link TEXT;",
+        "ALTER TABLE conversations ADD COLUMN ai_category TEXT;",
+        "ALTER TABLE conversations ADD COLUMN ai_confidence TEXT;",
+        "ALTER TABLE conversations ADD COLUMN ai_summary TEXT;",
+        "ALTER TABLE conversations ADD COLUMN ai_review_datetime TEXT;",
+        "ALTER TABLE conversations ADD COLUMN ai_kb_confirmed INTEGER;",
+        "ALTER TABLE conversations ADD COLUMN ai_kb_confirm_datetime TEXT;",
+        "ALTER TABLE conversations ADD COLUMN ai_kb_confirm_notes TEXT;"
+    )
+    foreach ($sql in $migrations) {
+        try {
+            Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $sql
+        } catch {
+            # Column already exists — ignore
+        }
+    }
+
+    # Create indexes for performance
+    $indexes = @(
+        "CREATE INDEX IF NOT EXISTS idx_emails_conversation_id ON emails(conversation_id);",
+        "CREATE INDEX IF NOT EXISTS idx_emails_last_modified ON emails(last_modified);",
+        "CREATE INDEX IF NOT EXISTS idx_emails_attachments_pending ON emails(has_attachments, attachments_downloaded);",
+        "CREATE INDEX IF NOT EXISTS idx_conversations_ai_review ON conversations(ai_kb_confirmed, ai_confidence);"
+    )
+    foreach ($sql in $indexes) {
+        Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $sql
     }
 
     Write-Host "Database ready: $($script:DatabasePath)"
@@ -404,10 +427,10 @@ ON CONFLICT(message_id) DO UPDATE SET
 # ===================================================================
 function Invoke-DownloadMissingAttachments {
     # Find emails that have attachments but haven't been downloaded yet
-    $pending = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
-        "SELECT message_id, subject FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0"
+    $pending = @(Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+        "SELECT message_id, subject FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0")
 
-    if (-not $pending -or $pending.Count -eq 0) {
+    if ($pending.Count -eq 0) {
         Write-Host "`nNo missing attachments found. All caught up!" -ForegroundColor Green
         return
     }
@@ -463,8 +486,14 @@ function Invoke-DownloadMissingAttachments {
                 }
 
                 $attSQL = @"
-INSERT OR REPLACE INTO attachments (id, message_id, filename, content_type, size_bytes, disk_path)
-VALUES (@id, @message_id, @filename, @content_type, @size_bytes, @disk_path);
+INSERT INTO attachments (id, message_id, filename, content_type, size_bytes, disk_path)
+VALUES (@id, @message_id, @filename, @content_type, @size_bytes, @disk_path)
+ON CONFLICT(id) DO UPDATE SET
+    message_id   = excluded.message_id,
+    filename     = excluded.filename,
+    content_type = excluded.content_type,
+    size_bytes   = excluded.size_bytes,
+    disk_path    = excluded.disk_path;
 "@
                 Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $attSQL -SqlParameters $attParams
                 $fileCount++
@@ -567,17 +596,74 @@ function Invoke-Sync {
 }
 
 # ===================================================================
+# HTML-TO-TEXT HELPER
+# ===================================================================
+function ConvertFrom-Html {
+    param([string]$Html)
+    if (-not $Html) { return "" }
+
+    $text = $Html
+    # Remove style and script blocks entirely (content + tags)
+    $text = $text -replace '<style[^>]*>[\s\S]*?</style>', ''
+    $text = $text -replace '<script[^>]*>[\s\S]*?</script>', ''
+    # Convert <br> and <br/> to newlines
+    $text = $text -replace '<br\s*/?>', "`n"
+    # Convert block-level closing tags to newlines (paragraphs, divs, headings, list items)
+    $text = $text -replace '</(?:p|div|h[1-6]|li|tr|blockquote)>', "`n"
+    # Strip all remaining HTML tags
+    $text = $text -replace '<[^>]+>', ''
+    # Decode common HTML entities
+    $text = $text -replace '&nbsp;', ' '
+    $text = $text -replace '&amp;', '&'
+    $text = $text -replace '&lt;', '<'
+    $text = $text -replace '&gt;', '>'
+    $text = $text -replace '&quot;', '"'
+    $text = $text -replace '&apos;', "'"
+    $text = $text -replace '&#(\d+);', { [char][int]$_.Groups[1].Value }
+    # Collapse runs of whitespace on each line, but preserve line breaks
+    $text = ($text -split "`n" | ForEach-Object { ($_ -replace '\s+', ' ').Trim() } | Where-Object { $_ -ne '' }) -join "`n"
+    return $text.Trim()
+}
+
+# ===================================================================
+# THREAD DEDUPLICATION HELPER
+# ===================================================================
+function Remove-QuotedContent {
+    param([string]$Body)
+    if (-not $Body) { return "" }
+
+    # Split into lines and find where quoted/forwarded content starts
+    $lines = $Body -split "`n"
+    $cutIndex = $lines.Count
+
+    for ($j = 0; $j -lt $lines.Count; $j++) {
+        $line = $lines[$j].Trim()
+        # Common Outlook quote markers
+        if ($line -match '^-{2,}\s*(Original Message|Forwarded message)' -or
+            $line -match '^From:\s+.+@' -and $j -gt 0 -and $lines[$j-1].Trim() -match '^(Sent|Date):' -or
+            $line -match '^_{10,}' -or
+            $line -match '^\s*On .+ wrote:\s*$' -or
+            $line -match '^>{2,}') {
+            $cutIndex = $j
+            break
+        }
+    }
+
+    return ($lines[0..([Math]::Max(0, $cutIndex - 1))] -join "`n").Trim()
+}
+
+# ===================================================================
 # BUILD CONVERSATIONS TABLE
 # ===================================================================
 function Build-ConversationRow {
     param([string]$ConvId)
 
     # Get all emails in this conversation, oldest first
-    $emails = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+    $emails = @(Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
         "SELECT subject, from_name, from_address, to_recipients, cc_recipients, sent_datetime, body_content, body_preview, has_attachments, web_link FROM emails WHERE conversation_id = @cid ORDER BY sent_datetime ASC" `
-        -SqlParameters @{ cid = $ConvId }
+        -SqlParameters @{ cid = $ConvId })
 
-    if (-not $emails -or $emails.Count -eq 0) { return }
+    if ($emails.Count -eq 0) { return }
 
     # Subject from the first email in the thread
     $subject = $emails[0].subject
@@ -601,15 +687,14 @@ function Build-ConversationRow {
     $threadParts = @()
     foreach ($e in $emails) {
         $body = if ($e.body_content) { $e.body_content } else { $e.body_preview }
-        # Strip HTML tags for clean text
-        $cleanBody = $body -replace '<[^>]+>', '' -replace '&nbsp;', ' ' -replace '&amp;', '&' -replace '&lt;', '<' -replace '&gt;', '>' -replace '&#\d+;', '' -replace '\s+', ' '
-        $cleanBody = $cleanBody.Trim()
+        $cleanBody = ConvertFrom-Html -Html $body
+        $cleanBody = Remove-QuotedContent -Body $cleanBody
 
-        $threadParts += @"
---- [$($e.sent_datetime)] From: $($e.from_name) <$($e.from_address)> ---
-To: $($e.to_recipients)
-$(if ($e.cc_recipients) { "CC: $($e.cc_recipients)`n" })$cleanBody
-"@
+        # Use string concatenation to avoid here-string interpolation risks
+        $header = "--- [" + $e.sent_datetime + "] From: " + $e.from_name + " <" + $e.from_address + "> ---"
+        $toLine = "To: " + $e.to_recipients
+        $ccLine = if ($e.cc_recipients) { "`nCC: " + $e.cc_recipients } else { "" }
+        $threadParts += $header + "`n" + $toLine + $ccLine + "`n" + $cleanBody
     }
     $fullThread = $threadParts -join "`n`n"
 
@@ -662,22 +747,22 @@ function Invoke-BuildConversations {
 
     if ($Mode -eq "full") {
         Write-Host "`nBuilding conversations table from ALL emails..." -ForegroundColor Cyan
-        $convIds = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
-            "SELECT DISTINCT conversation_id FROM emails WHERE conversation_id IS NOT NULL"
+        $convIds = @(Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+            "SELECT DISTINCT conversation_id FROM emails WHERE conversation_id IS NOT NULL")
     }
     else {
         # Incremental: find conversations where any email was modified after the conversation was last built
         Write-Host "`nFinding conversations with new/changed emails..." -ForegroundColor Cyan
-        $convIds = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query @"
+        $convIds = @(Invoke-SqliteQuery -DataSource $script:DatabasePath -Query @"
 SELECT DISTINCT e.conversation_id
 FROM emails e
 LEFT JOIN conversations c ON e.conversation_id = c.conversation_id
 WHERE e.conversation_id IS NOT NULL
   AND (c.last_built IS NULL OR e.last_modified > c.last_built)
-"@
+"@)
     }
 
-    if (-not $convIds -or $convIds.Count -eq 0) {
+    if ($convIds.Count -eq 0) {
         Write-Host "No conversations to process. All up to date!" -ForegroundColor Green
         return
     }
