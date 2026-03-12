@@ -355,10 +355,17 @@ function Convert-MailToRow {
     $cleanBody = ConvertFrom-Html -Html $bodyCont
     $cleanBody = Remove-QuotedContent -Body $cleanBody
 
+    # Sanitize all text fields for CSV safety — replace newlines with literal \n
+    # so each email stays on exactly one CSV row. Raw HTML body is dropped entirely
+    # (it destroys CSV structure). Use cleaned_body for AI, Graph API for originals.
+    $safeCleanBody  = if ($cleanBody)          { $cleanBody -replace "`r`n", '\n' -replace "`n", '\n' -replace "`r", '\n' } else { "" }
+    $safePreview    = if ($Mail.bodyPreview)    { $Mail.bodyPreview -replace "`r`n", '\n' -replace "`n", '\n' -replace "`r", '\n' } else { "" }
+    $safeSubject    = if ($Mail.subject)        { $Mail.subject -replace "`r`n", ' ' -replace "`n", ' ' -replace "`r", ' ' } else { "" }
+
     return [PSCustomObject]@{
         message_id             = $Mail.id
         conversation_id        = $Mail.conversationId
-        subject                = $Mail.subject
+        subject                = $safeSubject
         from_name              = $fromName
         from_address           = $fromAddress
         to_recipients          = (Format-Recipients $Mail.toRecipients)
@@ -373,9 +380,8 @@ function Convert-MailToRow {
         is_read                = [int]$Mail.isRead
         is_draft               = [int]$Mail.isDraft
         body_content_type      = $bodyType
-        body_content           = $bodyCont
-        body_preview           = $Mail.bodyPreview
-        cleaned_body           = $cleanBody
+        body_preview           = $safePreview
+        cleaned_body           = $safeCleanBody
         web_link               = $Mail.webLink
         folder                 = $Folder
         categories             = ($Mail.categories -join "; ")
@@ -595,17 +601,20 @@ function Invoke-BuildConversations {
         }
         $participants = ($allParticipants.Keys | Sort-Object) -join "; "
 
-        # Build thread text
+        # Build thread text (using \n literals so CSV stays one-row-per-conversation)
         $threadParts = @()
         foreach ($e in $emails) {
-            $body = if ($e.cleaned_body) { $e.cleaned_body } else { $e.body_preview }
+            # cleaned_body already has \n literals from email CSV; body_preview may have real newlines
+            $body = if ($e.cleaned_body) { $e.cleaned_body } else {
+                if ($e.body_preview) { $e.body_preview -replace "`r`n", '\n' -replace "`n", '\n' -replace "`r", '\n' } else { "" }
+            }
 
             $header = "--- [" + $e.sent_datetime + "] From: " + $e.from_name + " <" + $e.from_address + "> ---"
             $toLine = "To: " + $e.to_recipients
-            $ccLine = if ($e.cc_recipients) { "`nCC: " + $e.cc_recipients } else { "" }
-            $threadParts += $header + "`n" + $toLine + $ccLine + "`n" + $body
+            $ccLine = if ($e.cc_recipients) { '\nCC: ' + $e.cc_recipients } else { "" }
+            $threadParts += $header + '\n' + $toLine + $ccLine + '\n' + $body
         }
-        $fullThread = $threadParts -join "`n`n"
+        $fullThread = $threadParts -join '\n\n'
 
         $hasAtt = [int](($emails | Where-Object { $_.has_attachments -eq "1" }).Count -gt 0)
         $outlookLink = ($emails | Where-Object { $_.web_link } | Select-Object -Last 1).web_link
