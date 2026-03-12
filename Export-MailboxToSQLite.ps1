@@ -275,11 +275,7 @@ CREATE TABLE IF NOT EXISTS conversations (
         "ALTER TABLE conversations ADD COLUMN ai_kb_confirm_notes TEXT;"
     )
     foreach ($sql in $migrations) {
-        try {
-            Invoke-MySQLiteQuery -Path $script:DatabasePath -Query $sql
-        } catch {
-            # Column already exists — ignore
-        }
+        Invoke-MySQLiteQuery -Path $script:DatabasePath -Query $sql -ErrorAction SilentlyContinue
     }
 
     # Create indexes for performance
