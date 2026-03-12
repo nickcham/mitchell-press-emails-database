@@ -3,57 +3,70 @@
     M365 Mailbox Email Exporter — interactive menu with Full, Incremental, and Attachment download modes.
 
 .DESCRIPTION
-    Connects to Microsoft Graph API and exports emails from Inbox and Sent Items
-    into a SQLite database. Offers four operating modes via an interactive menu:
+    Connects to Microsoft Graph via interactive browser login (supports MFA),
+    then exports emails from Inbox and Sent Items into a SQLite database.
 
+    Menu options:
     1) Full Export                — wipes and re-downloads every email
     2) Incremental Sync          — only fetches new/changed emails since last run
-    3) Download Missing Attachments — scans DB for emails not yet downloaded, fetches attachments to disk
+    3) Download Missing Attachments — scans DB for emails not yet downloaded, fetches to disk
     Q) Quit
 
     Email sync and attachment downloading are separate operations. Emails are marked
     with an attachments_downloaded flag so option 3 only fetches what's missing.
 
+    By default, authentication uses interactive browser login — a browser window
+    opens, you sign in with your Microsoft 365 account, complete MFA, and the
+    script runs against your mailbox. No app registration required for personal use.
+
+    For unattended/service scenarios, you can optionally supply ClientId, TenantId,
+    ClientSecret, and UserEmail for app-only (client credentials) auth.
+
 .PARAMETER DatabasePath
     Path to the SQLite database file. Created if it doesn't exist.
-
-.PARAMETER ClientId
-    Azure AD App Registration Client ID.
-
-.PARAMETER TenantId
-    Azure AD Tenant ID.
-
-.PARAMETER ClientSecret
-    Client Secret for app-only auth. If omitted, uses interactive (delegated) auth.
-
-.PARAMETER UserEmail
-    The mailbox email address to export (required for app-only auth).
 
 .PARAMETER AttachmentPath
     Folder where attachments are saved. Defaults to .\Attachments
 
+.PARAMETER ClientId
+    (Optional) Azure AD App Registration Client ID. Only needed for app-only auth.
+
+.PARAMETER TenantId
+    (Optional) Azure AD Tenant ID. Only needed for app-only auth.
+
+.PARAMETER ClientSecret
+    (Optional) Client Secret for app-only auth.
+
+.PARAMETER UserEmail
+    (Optional) Target mailbox email address. Required for app-only auth.
+
 .EXAMPLE
-    .\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db" -ClientId "abc" -TenantId "xyz"
+    # Simple — browser login with MFA (most common)
+    .\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db"
+
+.EXAMPLE
+    # App-only (unattended, client credentials)
+    .\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db" -ClientId "abc" -TenantId "xyz" -ClientSecret "secret" -UserEmail "user@domain.com"
 #>
 
 param(
     [Parameter(Mandatory = $true)]
     [string]$DatabasePath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
+    [string]$AttachmentPath = ".\Attachments",
+
+    [Parameter(Mandatory = $false)]
     [string]$ClientId,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
     [string]$TenantId,
 
     [Parameter(Mandatory = $false)]
     [string]$ClientSecret,
 
     [Parameter(Mandatory = $false)]
-    [string]$UserEmail,
-
-    [Parameter(Mandatory = $false)]
-    [string]$AttachmentPath = ".\Attachments"
+    [string]$UserEmail
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,6 +113,10 @@ foreach ($mod in $requiredModules) {
 # ===================================================================
 function Connect-ToGraph {
     if ($script:ClientSecret) {
+        # App-only auth (client credentials) — unattended / service account
+        if (-not $script:ClientId -or -not $script:TenantId) {
+            throw "ClientId and TenantId are required when using ClientSecret authentication."
+        }
         if (-not $script:UserEmail) {
             throw "UserEmail is required when using app-only (ClientSecret) authentication."
         }
@@ -107,12 +124,21 @@ function Connect-ToGraph {
         $credential = New-Object System.Management.Automation.PSCredential($script:ClientId, $secureSecret)
         Connect-MgGraph -TenantId $script:TenantId -ClientSecretCredential $credential -NoWelcome
         $script:basePath = "users/$($script:UserEmail)"
+        Write-Host "Authenticated (app-only) for $($script:UserEmail)." -ForegroundColor Green
     }
     else {
-        Connect-MgGraph -TenantId $script:TenantId -ClientId $script:ClientId -Scopes "Mail.Read", "Mail.ReadWrite" -NoWelcome
+        # Interactive browser login — opens browser, you sign in with MFA
+        Write-Host "Opening browser for Microsoft 365 sign-in..." -ForegroundColor Cyan
+        $connectParams = @{
+            Scopes    = @("Mail.Read", "Mail.ReadWrite")
+            NoWelcome = $true
+        }
+        if ($script:TenantId) { $connectParams.TenantId = $script:TenantId }
+        if ($script:ClientId) { $connectParams.ClientId = $script:ClientId }
+        Connect-MgGraph @connectParams
         $script:basePath = "me"
+        Write-Host "Authenticated via browser login." -ForegroundColor Green
     }
-    Write-Host "Authenticated to Microsoft Graph." -ForegroundColor Green
 }
 
 # ===================================================================

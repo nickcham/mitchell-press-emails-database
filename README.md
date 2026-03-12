@@ -9,22 +9,17 @@ PowerShell script that exports every email from an M365 mailbox (Inbox + Sent It
   - `Microsoft.Graph.Authentication`
   - `PSSQLite`
 
-## Azure AD App Registration
-
-1. Go to [Azure Portal > App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) and create a new registration.
-2. Note the **Application (client) ID** and **Directory (tenant) ID**.
-3. Choose your auth method:
-
-| Method | When to use | Permissions needed |
-|---|---|---|
-| **Interactive (delegated)** | Running as yourself | `Mail.Read` (delegated) |
-| **App-only (client secret)** | Unattended / service account | `Mail.Read` (application) + admin consent |
-
-For **app-only** auth, also create a client secret under **Certificates & secrets**.
-
 ## Usage
 
-Launch the script — it authenticates, then shows an interactive menu:
+### Quick start — interactive browser login (with MFA)
+
+```powershell
+.\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db"
+```
+
+That's it. A browser window opens, you sign in with your Microsoft 365 account, complete MFA if prompted, and the script runs against your mailbox. No app registration needed.
+
+The interactive menu then appears:
 
 ```
 ============================================
@@ -43,16 +38,15 @@ Launch the script — it authenticates, then shows an interactive menu:
   [Q] Quit
 ```
 
-### Interactive login (delegated)
+### Custom attachment folder
 
 ```powershell
-.\Export-MailboxToSQLite.ps1 `
-    -DatabasePath ".\emails.db" `
-    -ClientId "your-client-id" `
-    -TenantId "your-tenant-id"
+.\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db" -AttachmentPath "D:\EmailAttachments"
 ```
 
-### App-only (client credentials)
+### App-only auth (optional — for unattended/service scenarios)
+
+If you need to run this without a user present, set up an [Azure AD App Registration](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) with `Mail.Read` (application) permission + admin consent, then:
 
 ```powershell
 .\Export-MailboxToSQLite.ps1 `
@@ -61,16 +55,6 @@ Launch the script — it authenticates, then shows an interactive menu:
     -TenantId "your-tenant-id" `
     -ClientSecret "your-client-secret" `
     -UserEmail "user@yourdomain.com"
-```
-
-### Custom attachment folder
-
-```powershell
-.\Export-MailboxToSQLite.ps1 `
-    -DatabasePath ".\emails.db" `
-    -ClientId "your-client-id" `
-    -TenantId "your-tenant-id" `
-    -AttachmentPath "D:\EmailAttachments"
 ```
 
 ## Menu Options
