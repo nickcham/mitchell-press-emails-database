@@ -97,6 +97,9 @@ function Show-Menu {
     Write-Host "  [5] Build Conversations (Incremental)" -ForegroundColor White
     Write-Host "      Update only conversations with new/changed emails" -ForegroundColor DarkGray
     Write-Host ""
+    Write-Host "  [6] Status & Quick Notes" -ForegroundColor Green
+    Write-Host "      Syncs, pending, throttling, custom app guide" -ForegroundColor DarkGray
+    Write-Host ""
     Write-Host "  [Q] Quit" -ForegroundColor Yellow
     Write-Host ""
     $choice = Read-Host "Select an option"
@@ -106,15 +109,17 @@ function Show-Menu {
 # ===================================================================
 # DEPENDENCIES
 # ===================================================================
-$requiredModules = @("Microsoft.Graph.Authentication", "PSSQLite")
+$requiredModules = @("Microsoft.Graph.Authentication", "MySQLite")
 
 foreach ($mod in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $mod)) {
-        Write-Host "Installing module: $mod ..."
+        Write-Host "Installing $mod ..." -ForegroundColor Yellow
         Install-Module -Name $mod -Scope CurrentUser -Force -AllowClobber
     }
     Import-Module $mod -Force
 }
+
+Write-Host "MySQLite v$((Get-Module MySQLite).Version) loaded" -ForegroundColor Green
 
 # ===================================================================
 # AUTHENTICATION
@@ -174,6 +179,7 @@ CREATE TABLE IF NOT EXISTS emails (
     body_content_type       TEXT,
     body_content            TEXT,
     body_preview            TEXT,
+    cleaned_body            TEXT,
     web_link                TEXT,
     folder                  TEXT,
     categories              TEXT,
@@ -233,14 +239,15 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 "@
 
-    Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createEmailsTable
-    Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createAttachmentsTable
-    Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createConversationsTable
-    Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createSyncTable
+    Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createEmailsTable
+    Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createAttachmentsTable
+    Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createConversationsTable
+    Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createSyncTable
 
     # Migrate existing databases — add columns that may not exist yet
     $migrations = @(
         "ALTER TABLE emails ADD COLUMN attachments_downloaded INTEGER DEFAULT 0;",
+        "ALTER TABLE emails ADD COLUMN cleaned_body TEXT;",
         "ALTER TABLE conversations ADD COLUMN outlook_link TEXT;",
         "ALTER TABLE conversations ADD COLUMN ai_category TEXT;",
         "ALTER TABLE conversations ADD COLUMN ai_confidence TEXT;",
@@ -252,7 +259,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     )
     foreach ($sql in $migrations) {
         try {
-            Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $sql
+            Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $sql
         } catch {
             # Column already exists — ignore
         }
@@ -266,7 +273,7 @@ CREATE TABLE IF NOT EXISTS conversations (
         "CREATE INDEX IF NOT EXISTS idx_conversations_ai_review ON conversations(ai_kb_confirmed, ai_confidence);"
     )
     foreach ($sql in $indexes) {
-        Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $sql
+        Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $sql
     }
 
     Write-Host "Database ready: $($script:DatabasePath)"
@@ -285,7 +292,7 @@ function Format-Recipients {
 
 function Get-LastSyncTime {
     param([string]$Folder)
-    $result = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+    $result = Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
         "SELECT MAX(completed_at) AS last_sync FROM sync_log WHERE folder = @folder AND sync_type IN ('full','incremental')" `
         -SqlParameters @{ folder = $Folder }
     if ($result.last_sync) { return $result.last_sync }
@@ -303,7 +310,7 @@ function Get-Emails {
     )
 
     $graphFolder = $FolderName  # "Inbox" or "SentItems"
-    $fields = 'id,conversationId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,sentDateTime,receivedDateTime,hasAttachments,importance,isRead,isDraft,body,bodyPreview,webLink,categories,internetMessageId,parentFolderId,createdDateTime,lastModifiedDateTime'
+    $fields = 'id,conversationId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,sentDateTime,receivedDateTime,hasAttachments,importance,isRead,isDraft,body,bodyPreview,uniqueBody,webLink,categories,internetMessageId,parentFolderId,createdDateTime,lastModifiedDateTime'
 
     $url = "https://graph.microsoft.com/v1.0/$BasePath/mailFolders/$graphFolder/messages"
     $url += "?`$top=100&`$select=$fields"
@@ -321,13 +328,25 @@ function Get-Emails {
 
     while ($url) {
         $pageCount++
-        Write-Host "  Fetching $FolderName page $pageCount ..."
-        $response = Invoke-MgGraphRequest -Method GET -Uri $url
-        $messages = $response.value
-        if ($messages) {
-            $allMessages += $messages
+        Write-Host "  Fetching $FolderName page $pageCount ..." -ForegroundColor Cyan
+
+        try {
+            $response = Invoke-MgGraphRequest -Method GET -Uri $url -ErrorAction Stop
+            if ($response.value) { $allMessages += $response.value }
+            $url = $response.'@odata.nextLink'
+        } catch {
+            if ($_.Exception.Response.StatusCode -eq 429) {
+                $retry = if ($_.Exception.Response.Headers["Retry-After"]) {
+                    [int]$_.Exception.Response.Headers["Retry-After"]
+                } else { 60 }
+                Write-Host "  429 throttled — sleeping $retry sec..." -ForegroundColor Red
+                Start-Sleep -Seconds $retry
+                continue
+            }
+            throw
         }
-        $url = $response.'@odata.nextLink'
+
+        Start-Sleep -Milliseconds (Get-Random -Minimum 700 -Maximum 1500)
     }
 
     return $allMessages
@@ -346,6 +365,10 @@ function Save-Email {
     $fromName    = if ($Mail.from) { $Mail.from.emailAddress.name } else { "" }
     $fromAddress = if ($Mail.from) { $Mail.from.emailAddress.address } else { "" }
 
+    # Prefer uniqueBody (Graph's quote-stripped version) when available
+    $bodyCont = if ($Mail.uniqueBody.content) { $Mail.uniqueBody.content } else { $Mail.body.content }
+    $bodyType = if ($Mail.uniqueBody) { $Mail.uniqueBody.contentType } else { $Mail.body.contentType }
+
     $params = @{
         message_id          = $Mail.id
         conversation_id     = $Mail.conversationId
@@ -362,8 +385,8 @@ function Save-Email {
         importance          = $Mail.importance
         is_read             = [int]$Mail.isRead
         is_draft            = [int]$Mail.isDraft
-        body_content_type   = $Mail.body.contentType
-        body_content        = $Mail.body.content
+        body_content_type   = $bodyType
+        body_content        = $bodyCont
         body_preview        = $Mail.bodyPreview
         web_link            = $Mail.webLink
         folder              = $Folder
@@ -419,7 +442,23 @@ ON CONFLICT(message_id) DO UPDATE SET
     last_modified       = excluded.last_modified;
 "@
 
-    Invoke-SqliteQuery -DataSource $DbPath -Query $upsertSQL -SqlParameters $params
+    try {
+        Invoke-MySQLiteQuery -DataSource $DbPath -Query $upsertSQL -SqlParameters $params
+    } catch {
+        Write-Host "Save failed for $($Mail.id): $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    # Generate cleaned_body from HTML
+    $clean = ConvertFrom-Html -Html $bodyCont
+    $clean = Remove-QuotedContent -Body $clean
+
+    try {
+        Invoke-MySQLiteQuery -DataSource $DbPath -Query `
+            "UPDATE emails SET cleaned_body = @c WHERE message_id = @id;" `
+            -SqlParameters @{ c = $clean; id = $Mail.id }
+    } catch {
+        Write-Host "Cleaned body update failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
 }
 
 # ===================================================================
@@ -427,7 +466,7 @@ ON CONFLICT(message_id) DO UPDATE SET
 # ===================================================================
 function Invoke-DownloadMissingAttachments {
     # Find emails that have attachments but haven't been downloaded yet
-    $pending = @(Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+    $pending = @(Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
         "SELECT message_id, subject FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0")
 
     if ($pending.Count -eq 0) {
@@ -495,12 +534,12 @@ ON CONFLICT(id) DO UPDATE SET
     size_bytes   = excluded.size_bytes,
     disk_path    = excluded.disk_path;
 "@
-                Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $attSQL -SqlParameters $attParams
+                Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $attSQL -SqlParameters $attParams
                 $fileCount++
             }
 
             # Mark this email as downloaded
-            Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+            Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
                 "UPDATE emails SET attachments_downloaded = 1 WHERE message_id = @mid;" `
                 -SqlParameters @{ mid = $msgId }
 
@@ -508,10 +547,12 @@ ON CONFLICT(id) DO UPDATE SET
             $errors++
             Write-Host "    ERROR on '$subj': $($_.Exception.Message)" -ForegroundColor Red
         }
+
+        Start-Sleep -Milliseconds (Get-Random -Minimum 800 -Maximum 1800)
     }
 
     # Summary
-    $totalPending = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+    $totalPending = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
         "SELECT COUNT(*) AS cnt FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0").cnt
 
     Write-Host ""
@@ -568,7 +609,7 @@ function Invoke-Sync {
             completed_at = $syncEnd
             emails_synced = $emails.Count
         }
-        Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+        Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
             "INSERT INTO sync_log (sync_type, folder, started_at, completed_at, emails_synced) VALUES (@sync_type, @folder, @started_at, @completed_at, @emails_synced);" `
             -SqlParameters $logParams
 
@@ -576,9 +617,12 @@ function Invoke-Sync {
         Write-Host "  Done: $folder ($($emails.Count) emails)" -ForegroundColor Green
     }
 
+    # Reclaim space after bulk operations
+    Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "VACUUM;"
+
     # Summary
-    $dbEmailCount = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails").cnt
-    $pendingAttach = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+    $dbEmailCount = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails").cnt
+    $pendingAttach = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
         "SELECT COUNT(*) AS cnt FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0").cnt
 
     Write-Host ""
@@ -659,7 +703,7 @@ function Build-ConversationRow {
     param([string]$ConvId)
 
     # Get all emails in this conversation, oldest first
-    $emails = @(Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+    $emails = @(Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
         "SELECT subject, from_name, from_address, to_recipients, cc_recipients, sent_datetime, body_content, body_preview, has_attachments, web_link FROM emails WHERE conversation_id = @cid ORDER BY sent_datetime ASC" `
         -SqlParameters @{ cid = $ConvId })
 
@@ -737,7 +781,7 @@ ON CONFLICT(conversation_id) DO UPDATE SET
     outlook_link           = excluded.outlook_link,
     last_built             = excluded.last_built;
 "@
-    Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $convSQL -SqlParameters $convParams
+    Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $convSQL -SqlParameters $convParams
 }
 
 function Invoke-BuildConversations {
@@ -747,13 +791,13 @@ function Invoke-BuildConversations {
 
     if ($Mode -eq "full") {
         Write-Host "`nBuilding conversations table from ALL emails..." -ForegroundColor Cyan
-        $convIds = @(Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+        $convIds = @(Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
             "SELECT DISTINCT conversation_id FROM emails WHERE conversation_id IS NOT NULL")
     }
     else {
         # Incremental: find conversations where any email was modified after the conversation was last built
         Write-Host "`nFinding conversations with new/changed emails..." -ForegroundColor Cyan
-        $convIds = @(Invoke-SqliteQuery -DataSource $script:DatabasePath -Query @"
+        $convIds = @(Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query @"
 SELECT DISTINCT e.conversation_id
 FROM emails e
 LEFT JOIN conversations c ON e.conversation_id = c.conversation_id
@@ -778,7 +822,7 @@ WHERE e.conversation_id IS NOT NULL
         Build-ConversationRow -ConvId $row.conversation_id
     }
 
-    $totalConv = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM conversations").cnt
+    $totalConv = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM conversations").cnt
 
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Green
@@ -787,6 +831,33 @@ WHERE e.conversation_id IS NOT NULL
     Write-Host "  Mode:                $Mode"
     Write-Host "  Conversations built: $($convIds.Count)"
     Write-Host "  Total in table:      $totalConv"
+    Write-Host ""
+}
+
+# ===================================================================
+# STATUS & QUICK NOTES
+# ===================================================================
+function Show-StatusAndNotes {
+    $emailCount     = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails").cnt
+    $convCount      = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM conversations").cnt
+    $pendingAttach  = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0").cnt
+    $lastSync       = Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT MAX(completed_at) AS last_sync FROM sync_log"
+
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host "   STATUS" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host "  Emails in DB:        $emailCount"
+    Write-Host "  Conversations:       $convCount"
+    Write-Host "  Attachments pending: $pendingAttach"
+    Write-Host "  Last sync:           $($lastSync.last_sync)"
+    Write-Host "  Database:            $($script:DatabasePath)"
+    Write-Host ""
+    Write-Host "  Quick Notes:" -ForegroundColor Yellow
+    Write-Host "  - 429 throttling is handled automatically (Retry-After header)" -ForegroundColor DarkGray
+    Write-Host "  - For CIPP/unattended, register a custom Azure AD app and pass" -ForegroundColor DarkGray
+    Write-Host "    -ClientId, -TenantId, -ClientSecret, -UserEmail" -ForegroundColor DarkGray
+    Write-Host "  - Conversations table preserves AI review columns on rebuild" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -806,6 +877,7 @@ while ($running) {
         "3" { Invoke-DownloadMissingAttachments }
         "4" { Invoke-BuildConversations -Mode "full" }
         "5" { Invoke-BuildConversations -Mode "incremental" }
+        "6" { Show-StatusAndNotes }
         "Q" { $running = $false }
         "q" { $running = $false }
         default {
