@@ -4,51 +4,18 @@
 
 .DESCRIPTION
     Connects to Microsoft Graph via interactive browser login (supports MFA),
-    then exports emails from Inbox and Sent Items into a SQLite database.
+    then exports emails from Inbox and Sent Items into a SQLite database using MySQLite.
 
     Menu options:
     1) Full Export                — downloads every email (first run or full re-scan)
-    2) Incremental Sync          — only fetches new/changed emails since last run
+    2) Incremental Sync           — only fetches new/changed emails since last run
     3) Download Missing Attachments — scans DB for emails not yet downloaded, fetches to disk
     4) Build Conversations (Full) — rebuild conversations table from all emails
     5) Build Conversations (Incremental) — update only changed conversations
+    6) Status & Quick Notes       — syncs, pending, throttling, custom app guide
     Q) Quit
 
-    Email sync and attachment downloading are separate operations. Emails are marked
-    with an attachments_downloaded flag so option 3 only fetches what's missing.
-
-    By default, authentication uses interactive browser login — a browser window
-    opens, you sign in with your Microsoft 365 account, complete MFA, and the
-    script runs against your mailbox. No app registration required for personal use.
-
-    For unattended/service scenarios, you can optionally supply ClientId, TenantId,
-    ClientSecret, and UserEmail for app-only (client credentials) auth.
-
-.PARAMETER DatabasePath
-    Path to the SQLite database file. Created if it doesn't exist.
-
-.PARAMETER AttachmentPath
-    Folder where attachments are saved. Defaults to .\Attachments
-
-.PARAMETER ClientId
-    (Optional) Azure AD App Registration Client ID. Only needed for app-only auth.
-
-.PARAMETER TenantId
-    (Optional) Azure AD Tenant ID. Only needed for app-only auth.
-
-.PARAMETER ClientSecret
-    (Optional) Client Secret for app-only auth.
-
-.PARAMETER UserEmail
-    (Optional) Target mailbox email address. Required for app-only auth.
-
-.EXAMPLE
-    # Simple — browser login with MFA (most common)
-    .\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db"
-
-.EXAMPLE
-    # App-only (unattended, client credentials)
-    .\Export-MailboxToSQLite.ps1 -DatabasePath ".\emails.db" -ClientId "abc" -TenantId "xyz" -ClientSecret "secret" -UserEmail "user@domain.com"
+    Uses MySQLite for modern, maintained SQLite operations.
 #>
 
 param(
@@ -74,6 +41,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ===================================================================
+# DEPENDENCIES - MySQLite (modern replacement for PSSQLite)
+# ===================================================================
+$requiredModules = @("Microsoft.Graph.Authentication", "MySQLite")
+
+foreach ($mod in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $mod)) {
+        Write-Host "Installing module: $mod ..." -ForegroundColor Yellow
+        Install-Module -Name $mod -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module $mod -Force
+}
+
+Write-Host "MySQLite v$((Get-Module MySQLite).Version) loaded — modern SQLite backend ready 💅" -ForegroundColor Green
+
+# ===================================================================
 # MENU
 # ===================================================================
 function Show-Menu {
@@ -86,7 +68,7 @@ function Show-Menu {
     Write-Host "      Download ALL emails (first run or full re-scan)" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [2] Incremental Sync" -ForegroundColor White
-    Write-Host "      Download only new/changed emails since last run" -ForegroundColor DarkGray
+    Write-Host "      Download only new/changed since last run" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [3] Download Missing Attachments" -ForegroundColor White
     Write-Host "      Scan DB and download attachments not yet saved to disk" -ForegroundColor DarkGray
@@ -98,7 +80,7 @@ function Show-Menu {
     Write-Host "      Update only conversations with new/changed emails" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [6] Status & Quick Notes" -ForegroundColor Green
-    Write-Host "      Syncs, pending, throttling, custom app guide" -ForegroundColor DarkGray
+    Write-Host "      Show syncs, pending, throttling reminders & custom app guide" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [Q] Quit" -ForegroundColor Yellow
     Write-Host ""
@@ -107,47 +89,31 @@ function Show-Menu {
 }
 
 # ===================================================================
-# DEPENDENCIES
-# ===================================================================
-$requiredModules = @("Microsoft.Graph.Authentication", "MySQLite")
-
-foreach ($mod in $requiredModules) {
-    if (-not (Get-Module -ListAvailable -Name $mod)) {
-        Write-Host "Installing $mod ..." -ForegroundColor Yellow
-        Install-Module -Name $mod -Scope CurrentUser -Force -AllowClobber
-    }
-    Import-Module $mod -Force
-}
-
-Write-Host "MySQLite v$((Get-Module MySQLite).Version) loaded" -ForegroundColor Green
-
-# ===================================================================
 # AUTHENTICATION
 # ===================================================================
 function Connect-ToGraph {
     if ($script:ClientSecret) {
-        # App-only auth (client credentials) — unattended / service account
-        if (-not $script:ClientId -or -not $script:TenantId) {
-            throw "ClientId and TenantId are required when using ClientSecret authentication."
-        }
-        if (-not $script:UserEmail) {
-            throw "UserEmail is required when using app-only (ClientSecret) authentication."
+        if (-not $script:ClientId -or -not $script:TenantId -or -not $script:UserEmail) {
+            throw "ClientId, TenantId, and UserEmail required for app-only auth."
         }
         $secureSecret = ConvertTo-SecureString $script:ClientSecret -AsPlainText -Force
         $credential = New-Object System.Management.Automation.PSCredential($script:ClientId, $secureSecret)
         Connect-MgGraph -TenantId $script:TenantId -ClientSecretCredential $credential -NoWelcome
         $script:basePath = "users/$($script:UserEmail)"
         Write-Host "Authenticated (app-only) for $($script:UserEmail)." -ForegroundColor Green
-    }
-    else {
-        # Interactive browser login — opens browser, you sign in with MFA
+    } else {
         Write-Host "Opening browser for Microsoft 365 sign-in..." -ForegroundColor Cyan
         $connectParams = @{
             Scopes    = @("Mail.Read", "Mail.ReadWrite")
             NoWelcome = $true
         }
         if ($script:TenantId) { $connectParams.TenantId = $script:TenantId }
-        if ($script:ClientId) { $connectParams.ClientId = $script:ClientId }
+        if ($script:ClientId) {
+            $connectParams.ClientId = $script:ClientId
+            Write-Host "Using custom app registration: $($script:ClientId)" -ForegroundColor Green
+        } else {
+            Write-Host "Using default Microsoft Graph PowerShell app (consider custom for security)" -ForegroundColor Yellow
+        }
         Connect-MgGraph @connectParams
         $script:basePath = "me"
         Write-Host "Authenticated via browser login." -ForegroundColor Green
@@ -225,14 +191,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     full_thread             TEXT,
     outlook_link            TEXT,
     last_built              TEXT,
-
-    -- AI first-pass triage
     ai_category             TEXT,
     ai_confidence           TEXT,
     ai_summary              TEXT,
     ai_review_datetime      TEXT,
-
-    -- AI second-pass confirmation
     ai_kb_confirmed         INTEGER,
     ai_kb_confirm_datetime  TEXT,
     ai_kb_confirm_notes     TEXT
@@ -241,10 +203,10 @@ CREATE TABLE IF NOT EXISTS conversations (
 
     Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createEmailsTable
     Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createAttachmentsTable
-    Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createConversationsTable
     Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createSyncTable
+    Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $createConversationsTable
 
-    # Migrate existing databases — add columns that may not exist yet
+    # Migrations
     $migrations = @(
         "ALTER TABLE emails ADD COLUMN attachments_downloaded INTEGER DEFAULT 0;",
         "ALTER TABLE emails ADD COLUMN cleaned_body TEXT;",
@@ -258,14 +220,10 @@ CREATE TABLE IF NOT EXISTS conversations (
         "ALTER TABLE conversations ADD COLUMN ai_kb_confirm_notes TEXT;"
     )
     foreach ($sql in $migrations) {
-        try {
-            Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $sql
-        } catch {
-            # Column already exists — ignore
-        }
+        try { Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $sql } catch {}
     }
 
-    # Create indexes for performance
+    # Indexes
     $indexes = @(
         "CREATE INDEX IF NOT EXISTS idx_emails_conversation_id ON emails(conversation_id);",
         "CREATE INDEX IF NOT EXISTS idx_emails_last_modified ON emails(last_modified);",
@@ -276,7 +234,7 @@ CREATE TABLE IF NOT EXISTS conversations (
         Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query $sql
     }
 
-    Write-Host "Database ready: $($script:DatabasePath)"
+    Write-Host "Database ready: $($script:DatabasePath)" -ForegroundColor Green
 }
 
 # ===================================================================
@@ -285,9 +243,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 function Format-Recipients {
     param([object[]]$Recipients)
     if (-not $Recipients) { return "" }
-    return ($Recipients | ForEach-Object {
-        "$($_.emailAddress.name) <$($_.emailAddress.address)>"
-    }) -join "; "
+    return ($Recipients | ForEach-Object { "$($_.emailAddress.name) <$($_.emailAddress.address)>" }) -join "; "
 }
 
 function Get-LastSyncTime {
@@ -295,12 +251,11 @@ function Get-LastSyncTime {
     $result = Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
         "SELECT MAX(completed_at) AS last_sync FROM sync_log WHERE folder = @folder AND sync_type IN ('full','incremental')" `
         -SqlParameters @{ folder = $Folder }
-    if ($result.last_sync) { return $result.last_sync }
-    return $null
+    return $result.last_sync
 }
 
 # ===================================================================
-# FETCH EMAILS (supports incremental filter)
+# FETCH EMAILS with throttling
 # ===================================================================
 function Get-Emails {
     param(
@@ -309,15 +264,14 @@ function Get-Emails {
         [string]$SinceDateTime
     )
 
-    $graphFolder = $FolderName  # "Inbox" or "SentItems"
+    $graphFolder = $FolderName
     $fields = 'id,conversationId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,sentDateTime,receivedDateTime,hasAttachments,importance,isRead,isDraft,body,bodyPreview,uniqueBody,webLink,categories,internetMessageId,parentFolderId,createdDateTime,lastModifiedDateTime'
 
     $url = "https://graph.microsoft.com/v1.0/$BasePath/mailFolders/$graphFolder/messages"
     $url += "?`$top=100&`$select=$fields"
 
     if ($SinceDateTime) {
-        $filter = "lastModifiedDateTime ge $SinceDateTime"
-        $url += "&`$filter=$filter"
+        $url += "&`$filter=lastModifiedDateTime ge $SinceDateTime"
         Write-Host "  Incremental filter: modified since $SinceDateTime" -ForegroundColor DarkYellow
     }
 
@@ -332,18 +286,18 @@ function Get-Emails {
 
         try {
             $response = Invoke-MgGraphRequest -Method GET -Uri $url -ErrorAction Stop
-            if ($response.value) { $allMessages += $response.value }
+            $messages = $response.value
+            if ($messages) { $allMessages += $messages }
             $url = $response.'@odata.nextLink'
-        } catch {
+        }
+        catch {
             if ($_.Exception.Response.StatusCode -eq 429) {
-                $retry = if ($_.Exception.Response.Headers["Retry-After"]) {
-                    [int]$_.Exception.Response.Headers["Retry-After"]
-                } else { 60 }
-                Write-Host "  429 throttled — sleeping $retry sec..." -ForegroundColor Red
-                Start-Sleep -Seconds $retry
+                $retrySec = if ($_.Exception.Response.Headers["Retry-After"]) { [int]$_.Exception.Response.Headers["Retry-After"] } else { 60 }
+                Write-Host "  Throttled (429)! Waiting $retrySec sec..." -ForegroundColor Red
+                Start-Sleep -Seconds $retrySec
                 continue
             }
-            throw
+            throw $_
         }
 
         Start-Sleep -Milliseconds (Get-Random -Minimum 700 -Maximum 1500)
@@ -353,7 +307,7 @@ function Get-Emails {
 }
 
 # ===================================================================
-# SAVE EMAIL
+# SAVE EMAIL + compute cleaned_body
 # ===================================================================
 function Save-Email {
     param(
@@ -365,9 +319,8 @@ function Save-Email {
     $fromName    = if ($Mail.from) { $Mail.from.emailAddress.name } else { "" }
     $fromAddress = if ($Mail.from) { $Mail.from.emailAddress.address } else { "" }
 
-    # Prefer uniqueBody (Graph's quote-stripped version) when available
-    $bodyCont = if ($Mail.uniqueBody.content) { $Mail.uniqueBody.content } else { $Mail.body.content }
-    $bodyType = if ($Mail.uniqueBody) { $Mail.uniqueBody.contentType } else { $Mail.body.contentType }
+    $bodyContent = if ($Mail.uniqueBody -and $Mail.uniqueBody.content) { $Mail.uniqueBody.content } else { $Mail.body.content }
+    $bodyType    = if ($Mail.uniqueBody) { $Mail.uniqueBody.contentType } else { $Mail.body.contentType }
 
     $params = @{
         message_id          = $Mail.id
@@ -386,7 +339,7 @@ function Save-Email {
         is_read             = [int]$Mail.isRead
         is_draft            = [int]$Mail.isDraft
         body_content_type   = $bodyType
-        body_content        = $bodyCont
+        body_content        = $bodyContent
         body_preview        = $Mail.bodyPreview
         web_link            = $Mail.webLink
         folder              = $Folder
@@ -397,7 +350,6 @@ function Save-Email {
         last_modified       = $Mail.lastModifiedDateTime
     }
 
-    # Preserve existing attachments_downloaded flag if the row already exists
     $upsertSQL = @"
 INSERT INTO emails (
     message_id, conversation_id, subject, from_name, from_address,
@@ -448,24 +400,23 @@ ON CONFLICT(message_id) DO UPDATE SET
         Write-Host "Save failed for $($Mail.id): $($_.Exception.Message)" -ForegroundColor Red
     }
 
-    # Generate cleaned_body from HTML
-    $clean = ConvertFrom-Html -Html $bodyCont
-    $clean = Remove-QuotedContent -Body $clean
+    # Cleaned body
+    $cleanBody = ConvertFrom-Html -Html $bodyContent
+    $cleanBody = Remove-QuotedContent -Body $cleanBody
 
     try {
         Invoke-MySQLiteQuery -DataSource $DbPath -Query `
-            "UPDATE emails SET cleaned_body = @c WHERE message_id = @id;" `
-            -SqlParameters @{ c = $clean; id = $Mail.id }
+            "UPDATE emails SET cleaned_body = @clean WHERE message_id = @mid;" `
+            -SqlParameters @{ clean = $cleanBody; mid = $Mail.id }
     } catch {
         Write-Host "Cleaned body update failed: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
 # ===================================================================
-# DOWNLOAD MISSING ATTACHMENTS (standalone operation)
+# DOWNLOAD MISSING ATTACHMENTS (with throttling & safe names)
 # ===================================================================
 function Invoke-DownloadMissingAttachments {
-    # Find emails that have attachments but haven't been downloaded yet
     $pending = @(Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
         "SELECT message_id, subject FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0")
 
@@ -476,7 +427,6 @@ function Invoke-DownloadMissingAttachments {
 
     Write-Host "`nFound $($pending.Count) email(s) with attachments to download." -ForegroundColor Cyan
 
-    # Ensure attachment folder exists
     if (-not (Test-Path $script:AttachmentPath)) {
         New-Item -Path $script:AttachmentPath -ItemType Directory -Force | Out-Null
     }
@@ -499,22 +449,17 @@ function Invoke-DownloadMissingAttachments {
             $response = Invoke-MgGraphRequest -Method GET -Uri $url
 
             foreach ($att in $response.value) {
-                # Skip reference attachments and items without content
-                if ($att.'@odata.type' -eq '#microsoft.graph.referenceAttachment') { continue }
-                if (-not $att.contentBytes) { continue }
+                if ($att.'@odata.type' -eq '#microsoft.graph.referenceAttachment' -or -not $att.contentBytes) { continue }
 
-                # Build safe filename: <attachment_id_short>_<original_filename>
-                # Uses attachment ID (not message ID) so multiple attachments per email don't collide
-                $safeAttId    = ($att.id -replace '[^a-zA-Z0-9]', '')[0..19] -join ''
+                $msgIdShort   = ($msgId -replace '[^a-zA-Z0-9]', '')[0..7] -join ''
+                $safeAttId    = ($att.id -replace '[^a-zA-Z0-9]', '')[0..15] -join ''
                 $safeFilename = $att.name -replace '[\\/:*?"<>|]', '_'
-                $diskFilename = "${safeAttId}_${safeFilename}"
-                $diskFullPath  = Join-Path $script:AttachmentPath $diskFilename
+                $diskFilename = if ($safeFilename) { "${msgIdShort}_${safeAttId}_${safeFilename}" } else { "${msgIdShort}_${safeAttId}" }
+                $diskFullPath = Join-Path $script:AttachmentPath $diskFilename
 
-                # Save file to disk
                 $bytes = [Convert]::FromBase64String($att.contentBytes)
                 [System.IO.File]::WriteAllBytes($diskFullPath, $bytes)
 
-                # Record in attachments table
                 $attParams = @{
                     id           = $att.id
                     message_id   = $msgId
@@ -538,7 +483,6 @@ ON CONFLICT(id) DO UPDATE SET
                 $fileCount++
             }
 
-            # Mark this email as downloaded
             Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
                 "UPDATE emails SET attachments_downloaded = 1 WHERE message_id = @mid;" `
                 -SqlParameters @{ mid = $msgId }
@@ -551,7 +495,6 @@ ON CONFLICT(id) DO UPDATE SET
         Start-Sleep -Milliseconds (Get-Random -Minimum 800 -Maximum 1800)
     }
 
-    # Summary
     $totalPending = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
         "SELECT COUNT(*) AS cnt FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0").cnt
 
@@ -582,7 +525,6 @@ function Invoke-Sync {
         Write-Host "`n--- Processing: $folder ---" -ForegroundColor Cyan
         $syncStart = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-        # Determine incremental filter
         $sinceDateTime = $null
         if ($Mode -ne "full") {
             $sinceDateTime = Get-LastSyncTime -Folder $folder
@@ -600,7 +542,6 @@ function Invoke-Sync {
             Save-Email -Mail $mail -Folder $folder -DbPath $script:DatabasePath
         }
 
-        # Log the sync
         $syncEnd = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         $logParams = @{
             sync_type    = $Mode
@@ -617,7 +558,8 @@ function Invoke-Sync {
         Write-Host "  Done: $folder ($($emails.Count) emails)" -ForegroundColor Green
     }
 
-    # Reclaim space after bulk operations
+    # Optimize DB
+    Write-Host "Optimizing database (VACUUM)..." -ForegroundColor Cyan
     Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "VACUUM;"
 
     # Summary
@@ -634,7 +576,7 @@ function Invoke-Sync {
     Write-Host "  Total in database:   $dbEmailCount"
     Write-Host "  Database file:       $($script:DatabasePath)"
     if ($pendingAttach -gt 0) {
-        Write-Host "  Attachments pending: $pendingAttach (use option 3 to download)" -ForegroundColor Yellow
+        Write-Host "  Attachments pending: $pendingAttach (use option 3)" -ForegroundColor Yellow
     }
     Write-Host ""
 }
@@ -645,18 +587,12 @@ function Invoke-Sync {
 function ConvertFrom-Html {
     param([string]$Html)
     if (-not $Html) { return "" }
-
     $text = $Html
-    # Remove style and script blocks entirely (content + tags)
     $text = $text -replace '<style[^>]*>[\s\S]*?</style>', ''
     $text = $text -replace '<script[^>]*>[\s\S]*?</script>', ''
-    # Convert <br> and <br/> to newlines
     $text = $text -replace '<br\s*/?>', "`n"
-    # Convert block-level closing tags to newlines (paragraphs, divs, headings, list items)
     $text = $text -replace '</(?:p|div|h[1-6]|li|tr|blockquote)>', "`n"
-    # Strip all remaining HTML tags
     $text = $text -replace '<[^>]+>', ''
-    # Decode common HTML entities
     $text = $text -replace '&nbsp;', ' '
     $text = $text -replace '&amp;', '&'
     $text = $text -replace '&lt;', '<'
@@ -664,7 +600,6 @@ function ConvertFrom-Html {
     $text = $text -replace '&quot;', '"'
     $text = $text -replace '&apos;', "'"
     $text = $text -replace '&#(\d+);', { [char][int]$_.Groups[1].Value }
-    # Collapse runs of whitespace on each line, but preserve line breaks
     $text = ($text -split "`n" | ForEach-Object { ($_ -replace '\s+', ' ').Trim() } | Where-Object { $_ -ne '' }) -join "`n"
     return $text.Trim()
 }
@@ -675,14 +610,10 @@ function ConvertFrom-Html {
 function Remove-QuotedContent {
     param([string]$Body)
     if (-not $Body) { return "" }
-
-    # Split into lines and find where quoted/forwarded content starts
     $lines = $Body -split "`n"
     $cutIndex = $lines.Count
-
     for ($j = 0; $j -lt $lines.Count; $j++) {
         $line = $lines[$j].Trim()
-        # Common Outlook quote markers
         if (($line -match '^-{2,}\s*(Original Message|Forwarded message)') -or
             ($line -match '^From:\s+.+@' -and $j -gt 0 -and $lines[$j-1].Trim() -match '^(Sent|Date):') -or
             ($line -match '^_{10,}') -or
@@ -692,27 +623,23 @@ function Remove-QuotedContent {
             break
         }
     }
-
     return ($lines[0..([Math]::Max(0, $cutIndex - 1))] -join "`n").Trim()
 }
 
 # ===================================================================
-# BUILD CONVERSATIONS TABLE
+# BUILD CONVERSATIONS TABLE (uses cleaned_body)
 # ===================================================================
 function Build-ConversationRow {
     param([string]$ConvId)
 
-    # Get all emails in this conversation, oldest first
     $emails = @(Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
-        "SELECT subject, from_name, from_address, to_recipients, cc_recipients, sent_datetime, body_content, body_preview, has_attachments, web_link FROM emails WHERE conversation_id = @cid ORDER BY sent_datetime ASC" `
+        "SELECT subject, from_name, from_address, to_recipients, cc_recipients, sent_datetime, cleaned_body, body_preview, has_attachments, web_link FROM emails WHERE conversation_id = @cid ORDER BY sent_datetime ASC" `
         -SqlParameters @{ cid = $ConvId })
 
     if ($emails.Count -eq 0) { return }
 
-    # Subject from the first email in the thread
     $subject = $emails[0].subject
 
-    # Collect unique participants from all from/to/cc fields
     $allParticipants = @{}
     foreach ($e in $emails) {
         if ($e.from_address) { $allParticipants[$e.from_address.ToLower()] = $e.from_name }
@@ -727,14 +654,9 @@ function Build-ConversationRow {
     }
     $participants = ($allParticipants.Keys | Sort-Object) -join "; "
 
-    # Build the full thread text for AI consumption
     $threadParts = @()
     foreach ($e in $emails) {
-        $body = if ($e.body_content) { $e.body_content } else { $e.body_preview }
-        $cleanBody = ConvertFrom-Html -Html $body
-        $cleanBody = Remove-QuotedContent -Body $cleanBody
-
-        # Use string concatenation to avoid here-string interpolation risks
+        $cleanBody = if ($e.cleaned_body) { $e.cleaned_body } else { $e.body_preview }
         $header = "--- [" + $e.sent_datetime + "] From: " + $e.from_name + " <" + $e.from_address + "> ---"
         $toLine = "To: " + $e.to_recipients
         $ccLine = if ($e.cc_recipients) { "`nCC: " + $e.cc_recipients } else { "" }
@@ -744,8 +666,6 @@ function Build-ConversationRow {
 
     $hasAtt = [int](($emails | Where-Object { $_.has_attachments -eq 1 }).Count -gt 0)
     $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-    # Use the most recent email's web_link so reviewer can open the conversation
     $outlookLink = ($emails | Where-Object { $_.web_link } | Select-Object -Last 1).web_link
 
     $convParams = @{
@@ -761,7 +681,6 @@ function Build-ConversationRow {
         last_built             = $now
     }
 
-    # Upsert: rebuild thread data but preserve existing AI review columns
     $convSQL = @"
 INSERT INTO conversations (
     conversation_id, subject, participants, message_count, has_attachments,
@@ -786,16 +705,14 @@ ON CONFLICT(conversation_id) DO UPDATE SET
 
 function Invoke-BuildConversations {
     param(
-        [string]$Mode  # "full" or "incremental"
+        [string]$Mode
     )
 
     if ($Mode -eq "full") {
         Write-Host "`nBuilding conversations table from ALL emails..." -ForegroundColor Cyan
         $convIds = @(Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query `
             "SELECT DISTINCT conversation_id FROM emails WHERE conversation_id IS NOT NULL")
-    }
-    else {
-        # Incremental: find conversations where any email was modified after the conversation was last built
+    } else {
         Write-Host "`nFinding conversations with new/changed emails..." -ForegroundColor Cyan
         $convIds = @(Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query @"
 SELECT DISTINCT e.conversation_id
@@ -803,7 +720,8 @@ FROM emails e
 LEFT JOIN conversations c ON e.conversation_id = c.conversation_id
 WHERE e.conversation_id IS NOT NULL
   AND (c.last_built IS NULL OR e.last_modified > c.last_built)
-"@)
+"@
+        )
     }
 
     if ($convIds.Count -eq 0) {
@@ -835,30 +753,67 @@ WHERE e.conversation_id IS NOT NULL
 }
 
 # ===================================================================
-# STATUS & QUICK NOTES
+# STATUS & QUICK NOTES (with custom app guide & links)
 # ===================================================================
 function Show-StatusAndNotes {
-    $emailCount     = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails").cnt
-    $convCount      = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM conversations").cnt
-    $pendingAttach  = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0").cnt
-    $lastSync       = Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT MAX(completed_at) AS last_sync FROM sync_log"
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Magenta
+    Write-Host "   Quick Status & Brain Reminders 💅" -ForegroundColor Magenta
+    Write-Host "============================================" -ForegroundColor Magenta
+    Write-Host ""
 
+    if ($script:ClientSecret) {
+        Write-Host "Auth: App-only (unattended) for $($script:UserEmail)" -ForegroundColor Cyan
+    } else {
+        Write-Host "Auth: Interactive browser (MFA ok)" -ForegroundColor Cyan
+        if ($script:ClientId) {
+            Write-Host "  Using custom app: $($script:ClientId)" -ForegroundColor Green
+        } else {
+            Write-Host "  Using default Microsoft SDK app — consider custom for security!" -ForegroundColor Yellow
+        }
+    }
     Write-Host ""
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host "   STATUS" -ForegroundColor Cyan
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host "  Emails in DB:        $emailCount"
-    Write-Host "  Conversations:       $convCount"
-    Write-Host "  Attachments pending: $pendingAttach"
-    Write-Host "  Last sync:           $($lastSync.last_sync)"
-    Write-Host "  Database:            $($script:DatabasePath)"
+
+    $lastInbox = Get-LastSyncTime -Folder "Inbox"
+    $lastSent  = Get-LastSyncTime -Folder "SentItems"
+    Write-Host "Last sync times:" -ForegroundColor White
+    Write-Host "  Inbox   → $($lastInbox ?? 'Never')" -ForegroundColor DarkGray
+    Write-Host "  Sent    → $($lastSent ?? 'Never')" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Quick Notes:" -ForegroundColor Yellow
-    Write-Host "  - 429 throttling is handled automatically (Retry-After header)" -ForegroundColor DarkGray
-    Write-Host "  - For CIPP/unattended, register a custom Azure AD app and pass" -ForegroundColor DarkGray
-    Write-Host "    -ClientId, -TenantId, -ClientSecret, -UserEmail" -ForegroundColor DarkGray
-    Write-Host "  - Conversations table preserves AI review columns on rebuild" -ForegroundColor DarkGray
+
+    $totalEmails = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails").cnt
+    $pendingAtt  = (Invoke-MySQLiteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM emails WHERE has_attachments = 1 AND attachments_downloaded = 0").cnt
+    Write-Host "Database quick stats:" -ForegroundColor White
+    Write-Host "  Emails stored:       $totalEmails" -ForegroundColor DarkGray
+    Write-Host "  Attachments pending: $pendingAtt  (run [3] to grab 'em)" -ForegroundColor $(if ($pendingAtt -gt 0) {'Yellow'} else {'Green'})
     Write-Host ""
+
+    Write-Host "Throttling reality check (2026 Graph Mail):" -ForegroundColor Yellow
+    Write-Host "  • ~10,000 requests / 10 min per mailbox soft target" -ForegroundColor DarkYellow
+    Write-Host "  • Sleeps + 429 handling in place — should stay safe" -ForegroundColor DarkYellow
+    Write-Host "  • Full export big mailbox? Be patient" -ForegroundColor DarkYellow
+    Write-Host ""
+
+    Write-Host "Custom App Reg Guide — Own Your Shit (CIPP-safe!)" -ForegroundColor Green
+    Write-Host "  Default SDK app is sketchy multi-tenant — create your own instead:" -ForegroundColor White
+    Write-Host "  1. Go straight to App registrations:" -ForegroundColor DarkGray
+    Write-Host "     https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade/~/AllApplications" -ForegroundColor Cyan
+    Write-Host "     → Click 'New registration'" -ForegroundColor DarkGray
+    Write-Host "     Name: 'Nick's Mailbox Exporter' (or whatever slays)" -ForegroundColor DarkGray
+    Write-Host "     Accounts: This org only (single tenant)" -ForegroundColor DarkGray
+    Write-Host "     Redirect URI: Leave blank" -ForegroundColor DarkGray
+    Write-Host "  2. After creation → API permissions → Add → Microsoft Graph → Delegated:" -ForegroundColor DarkGray
+    Write-Host "     Mail.Read (add Mail.ReadWrite if needed)" -ForegroundColor DarkGray
+    Write-Host "     → Grant admin consent for your tenant" -ForegroundColor DarkGray
+    Write-Host "  3. Copy Application (client) ID from Overview" -ForegroundColor DarkGray
+    Write-Host "  4. Run script with: -ClientId 'your-new-id-here'" -ForegroundColor DarkGray
+    Write-Host "     Example: .\script.ps1 -DatabasePath .\emails.db -ClientId '1234abcd-...'" -ForegroundColor Cyan
+    Write-Host "  • To check/manage your new app later:" -ForegroundColor DarkGray
+    Write-Host "     https://entra.microsoft.com/#view/Microsoft_AAD_IAM/EnterpriseApplicationsMenuBlade/~/AllApps" -ForegroundColor Cyan
+    Write-Host "  • Pre-consent in CIPP/Entra → no user prompts, audit-friendly" -ForegroundColor Yellow
+    Write-Host ""
+
+    Read-Host "Press Enter to return to menu..."
 }
 
 # ===================================================================
@@ -887,4 +842,4 @@ while ($running) {
 }
 
 Disconnect-MgGraph | Out-Null
-Write-Host "Disconnected from Microsoft Graph. Goodbye!" -ForegroundColor Cyan
+Write-Host "Disconnected from Microsoft Graph. Goodbye, my king!" -ForegroundColor Cyan
