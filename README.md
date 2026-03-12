@@ -142,7 +142,17 @@ Only rebuilds conversations where an email's `last_modified` timestamp is newer 
 | `first_message_datetime` | TEXT | Earliest email in the thread |
 | `last_message_datetime` | TEXT | Most recent email in the thread |
 | `full_thread` | TEXT | Complete conversation as clean text (HTML stripped, chronological) |
+| `outlook_link` | TEXT | Outlook web link to the most recent email (for manual review) |
 | `last_built` | TEXT | When this conversation row was last rebuilt |
+| **AI First-Pass Triage** | | |
+| `ai_category` | TEXT | AI-assigned category: `fact`, `how-to`, `info`, `kb`, `rubber-stamp`, `not-relevant` |
+| `ai_confidence` | TEXT | AI confidence level: `low`, `medium`, `high` |
+| `ai_summary` | TEXT | AI comment on what the conversation is about and why it may be worth preserving |
+| `ai_review_datetime` | TEXT | When AI first-pass review was performed |
+| **AI Second-Pass Confirmation** | | |
+| `ai_kb_confirmed` | INTEGER | 1 = confirmed for KB/RAG, 0 = rejected, NULL = not yet reviewed |
+| `ai_kb_confirm_datetime` | TEXT | When AI second-pass confirmation was performed |
+| `ai_kb_confirm_notes` | TEXT | AI notes on final KB decision (what to document, how to structure) |
 
 ### `sync_log` table
 

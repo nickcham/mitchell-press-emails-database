@@ -217,7 +217,19 @@ CREATE TABLE IF NOT EXISTS conversations (
     first_message_datetime  TEXT,
     last_message_datetime   TEXT,
     full_thread             TEXT,
-    last_built              TEXT
+    outlook_link            TEXT,
+    last_built              TEXT,
+
+    -- AI first-pass triage
+    ai_category             TEXT,
+    ai_confidence           TEXT,
+    ai_summary              TEXT,
+    ai_review_datetime      TEXT,
+
+    -- AI second-pass confirmation
+    ai_kb_confirmed         INTEGER,
+    ai_kb_confirm_datetime  TEXT,
+    ai_kb_confirm_notes     TEXT
 );
 "@
 
@@ -562,7 +574,7 @@ function Build-ConversationRow {
 
     # Get all emails in this conversation, oldest first
     $emails = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
-        "SELECT subject, from_name, from_address, to_recipients, cc_recipients, sent_datetime, body_content, body_preview, has_attachments FROM emails WHERE conversation_id = @cid ORDER BY sent_datetime ASC" `
+        "SELECT subject, from_name, from_address, to_recipients, cc_recipients, sent_datetime, body_content, body_preview, has_attachments, web_link FROM emails WHERE conversation_id = @cid ORDER BY sent_datetime ASC" `
         -SqlParameters @{ cid = $ConvId }
 
     if (-not $emails -or $emails.Count -eq 0) { return }
@@ -604,6 +616,9 @@ $(if ($e.cc_recipients) { "CC: $($e.cc_recipients)`n" })$cleanBody
     $hasAtt = [int](($emails | Where-Object { $_.has_attachments -eq 1 }).Count -gt 0)
     $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
+    # Use the most recent email's web_link so reviewer can open the conversation
+    $outlookLink = ($emails | Where-Object { $_.web_link } | Select-Object -Last 1).web_link
+
     $convParams = @{
         conversation_id        = $ConvId
         subject                = $subject
@@ -613,17 +628,29 @@ $(if ($e.cc_recipients) { "CC: $($e.cc_recipients)`n" })$cleanBody
         first_message_datetime = $emails[0].sent_datetime
         last_message_datetime  = $emails[-1].sent_datetime
         full_thread            = $fullThread
+        outlook_link           = $outlookLink
         last_built             = $now
     }
 
+    # Upsert: rebuild thread data but preserve existing AI review columns
     $convSQL = @"
-INSERT OR REPLACE INTO conversations (
+INSERT INTO conversations (
     conversation_id, subject, participants, message_count, has_attachments,
-    first_message_datetime, last_message_datetime, full_thread, last_built
+    first_message_datetime, last_message_datetime, full_thread, outlook_link, last_built
 ) VALUES (
     @conversation_id, @subject, @participants, @message_count, @has_attachments,
-    @first_message_datetime, @last_message_datetime, @full_thread, @last_built
-);
+    @first_message_datetime, @last_message_datetime, @full_thread, @outlook_link, @last_built
+)
+ON CONFLICT(conversation_id) DO UPDATE SET
+    subject                = excluded.subject,
+    participants           = excluded.participants,
+    message_count          = excluded.message_count,
+    has_attachments        = excluded.has_attachments,
+    first_message_datetime = excluded.first_message_datetime,
+    last_message_datetime  = excluded.last_message_datetime,
+    full_thread            = excluded.full_thread,
+    outlook_link           = excluded.outlook_link,
+    last_built             = excluded.last_built;
 "@
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $convSQL -SqlParameters $convParams
 }
