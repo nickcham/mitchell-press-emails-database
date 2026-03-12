@@ -35,6 +35,12 @@ The interactive menu then appears:
   [3] Download Missing Attachments
       Scan DB and download attachments not yet saved to disk
 
+  [4] Build Conversations (Full)
+      Rebuild conversations table from all emails in DB
+
+  [5] Build Conversations (Incremental)
+      Update only conversations with new/changed emails
+
   [Q] Quit
 ```
 
@@ -73,6 +79,12 @@ A **separate, standalone operation** that:
 4. Marks the email's `attachments_downloaded` flag to `1`
 
 This means you can sync emails first (option 1 or 2), then come back later and download attachments at your own pace. Re-running option 3 will only fetch what's still missing.
+
+### 4 — Build Conversations (Full)
+Reads every email in the database and groups them by `conversation_id` into the `conversations` table. Each row contains the full chronological thread as clean text — this is the table AI uses for KB lookups. No Graph API calls needed; it works entirely from local data.
+
+### 5 — Build Conversations (Incremental)
+Only rebuilds conversations where an email's `last_modified` timestamp is newer than the conversation's `last_built` timestamp. Fast for keeping the conversations table current after an incremental email sync.
 
 ## Database Schema
 
@@ -118,6 +130,20 @@ This means you can sync emails first (option 1 or 2), then come back later and d
 | `size_bytes` | INTEGER | File size in bytes |
 | `disk_path` | TEXT | Full path to saved file on disk |
 
+### `conversations` table (AI / KB)
+
+| Column | Type | Description |
+|---|---|---|
+| `conversation_id` | TEXT (PK) | Graph conversation thread ID |
+| `subject` | TEXT | Subject from the first email in the thread |
+| `participants` | TEXT | All unique email addresses (semicolon-separated) |
+| `message_count` | INTEGER | Number of emails in the conversation |
+| `has_attachments` | INTEGER | 1 if any email in the thread has attachments |
+| `first_message_datetime` | TEXT | Earliest email in the thread |
+| `last_message_datetime` | TEXT | Most recent email in the thread |
+| `full_thread` | TEXT | Complete conversation as clean text (HTML stripped, chronological) |
+| `last_built` | TEXT | When this conversation row was last rebuilt |
+
 ### `sync_log` table
 
 | Column | Type | Description |
@@ -142,6 +168,12 @@ Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT subject, from_addres
 
 # Downloaded attachments and their paths
 Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT e.subject, a.filename, a.disk_path FROM emails e JOIN attachments a ON e.message_id = a.message_id"
+
+# Search conversations (AI/KB table)
+Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT subject, participants, message_count, last_message_datetime FROM conversations ORDER BY last_message_datetime DESC LIMIT 10"
+
+# Full thread text for a conversation
+Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT full_thread FROM conversations WHERE subject LIKE '%project update%'"
 
 # Sync history
 Invoke-SqliteQuery -DataSource ".\emails.db" -Query "SELECT * FROM sync_log ORDER BY completed_at DESC"

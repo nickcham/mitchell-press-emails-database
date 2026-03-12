@@ -10,6 +10,8 @@
     1) Full Export                — downloads every email (first run or full re-scan)
     2) Incremental Sync          — only fetches new/changed emails since last run
     3) Download Missing Attachments — scans DB for emails not yet downloaded, fetches to disk
+    4) Build Conversations (Full) — rebuild conversations table from all emails
+    5) Build Conversations (Incremental) — update only changed conversations
     Q) Quit
 
     Email sync and attachment downloading are separate operations. Emails are marked
@@ -88,6 +90,12 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  [3] Download Missing Attachments" -ForegroundColor White
     Write-Host "      Scan DB and download attachments not yet saved to disk" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [4] Build Conversations (Full)" -ForegroundColor White
+    Write-Host "      Rebuild conversations table from all emails in DB" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [5] Build Conversations (Incremental)" -ForegroundColor White
+    Write-Host "      Update only conversations with new/changed emails" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [Q] Quit" -ForegroundColor Yellow
     Write-Host ""
@@ -199,8 +207,23 @@ CREATE TABLE IF NOT EXISTS sync_log (
 );
 "@
 
+    $createConversationsTable = @"
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id         TEXT PRIMARY KEY,
+    subject                 TEXT,
+    participants            TEXT,
+    message_count           INTEGER,
+    has_attachments         INTEGER,
+    first_message_datetime  TEXT,
+    last_message_datetime   TEXT,
+    full_thread             TEXT,
+    last_built              TEXT
+);
+"@
+
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createEmailsTable
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createAttachmentsTable
+    Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createConversationsTable
     Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $createSyncTable
 
     # Add attachments_downloaded column to existing databases that lack it
@@ -532,6 +555,130 @@ function Invoke-Sync {
 }
 
 # ===================================================================
+# BUILD CONVERSATIONS TABLE
+# ===================================================================
+function Build-ConversationRow {
+    param([string]$ConvId)
+
+    # Get all emails in this conversation, oldest first
+    $emails = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+        "SELECT subject, from_name, from_address, to_recipients, cc_recipients, sent_datetime, body_content, body_preview, has_attachments FROM emails WHERE conversation_id = @cid ORDER BY sent_datetime ASC" `
+        -SqlParameters @{ cid = $ConvId }
+
+    if (-not $emails -or $emails.Count -eq 0) { return }
+
+    # Subject from the first email in the thread
+    $subject = $emails[0].subject
+
+    # Collect unique participants from all from/to/cc fields
+    $allParticipants = @{}
+    foreach ($e in $emails) {
+        if ($e.from_address) { $allParticipants[$e.from_address.ToLower()] = $e.from_name }
+        foreach ($field in @($e.to_recipients, $e.cc_recipients)) {
+            if (-not $field) { continue }
+            foreach ($entry in ($field -split '; ')) {
+                if ($entry -match '<(.+)>') {
+                    $allParticipants[$Matches[1].ToLower()] = $entry
+                }
+            }
+        }
+    }
+    $participants = ($allParticipants.Keys | Sort-Object) -join "; "
+
+    # Build the full thread text for AI consumption
+    $threadParts = @()
+    foreach ($e in $emails) {
+        $body = if ($e.body_content) { $e.body_content } else { $e.body_preview }
+        # Strip HTML tags for clean text
+        $cleanBody = $body -replace '<[^>]+>', '' -replace '&nbsp;', ' ' -replace '&amp;', '&' -replace '&lt;', '<' -replace '&gt;', '>' -replace '&#\d+;', '' -replace '\s+', ' '
+        $cleanBody = $cleanBody.Trim()
+
+        $threadParts += @"
+--- [$($e.sent_datetime)] From: $($e.from_name) <$($e.from_address)> ---
+To: $($e.to_recipients)
+$(if ($e.cc_recipients) { "CC: $($e.cc_recipients)`n" })$cleanBody
+"@
+    }
+    $fullThread = $threadParts -join "`n`n"
+
+    $hasAtt = [int](($emails | Where-Object { $_.has_attachments -eq 1 }).Count -gt 0)
+    $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    $convParams = @{
+        conversation_id        = $ConvId
+        subject                = $subject
+        participants           = $participants
+        message_count          = $emails.Count
+        has_attachments        = $hasAtt
+        first_message_datetime = $emails[0].sent_datetime
+        last_message_datetime  = $emails[-1].sent_datetime
+        full_thread            = $fullThread
+        last_built             = $now
+    }
+
+    $convSQL = @"
+INSERT OR REPLACE INTO conversations (
+    conversation_id, subject, participants, message_count, has_attachments,
+    first_message_datetime, last_message_datetime, full_thread, last_built
+) VALUES (
+    @conversation_id, @subject, @participants, @message_count, @has_attachments,
+    @first_message_datetime, @last_message_datetime, @full_thread, @last_built
+);
+"@
+    Invoke-SqliteQuery -DataSource $script:DatabasePath -Query $convSQL -SqlParameters $convParams
+}
+
+function Invoke-BuildConversations {
+    param(
+        [string]$Mode  # "full" or "incremental"
+    )
+
+    if ($Mode -eq "full") {
+        Write-Host "`nBuilding conversations table from ALL emails..." -ForegroundColor Cyan
+        $convIds = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query `
+            "SELECT DISTINCT conversation_id FROM emails WHERE conversation_id IS NOT NULL"
+    }
+    else {
+        # Incremental: find conversations where any email was modified after the conversation was last built
+        Write-Host "`nFinding conversations with new/changed emails..." -ForegroundColor Cyan
+        $convIds = Invoke-SqliteQuery -DataSource $script:DatabasePath -Query @"
+SELECT DISTINCT e.conversation_id
+FROM emails e
+LEFT JOIN conversations c ON e.conversation_id = c.conversation_id
+WHERE e.conversation_id IS NOT NULL
+  AND (c.last_built IS NULL OR e.last_modified > c.last_built)
+"@
+    }
+
+    if (-not $convIds -or $convIds.Count -eq 0) {
+        Write-Host "No conversations to process. All up to date!" -ForegroundColor Green
+        return
+    }
+
+    Write-Host "  Processing $($convIds.Count) conversation(s)..." -ForegroundColor White
+
+    $i = 0
+    foreach ($row in $convIds) {
+        $i++
+        if ($i % 50 -eq 0 -or $i -eq $convIds.Count) {
+            Write-Host "    Building $i / $($convIds.Count) ..." -ForegroundColor DarkGray
+        }
+        Build-ConversationRow -ConvId $row.conversation_id
+    }
+
+    $totalConv = (Invoke-SqliteQuery -DataSource $script:DatabasePath -Query "SELECT COUNT(*) AS cnt FROM conversations").cnt
+
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Green
+    Write-Host "   CONVERSATIONS BUILD COMPLETE" -ForegroundColor Green
+    Write-Host "============================================" -ForegroundColor Green
+    Write-Host "  Mode:                $Mode"
+    Write-Host "  Conversations built: $($convIds.Count)"
+    Write-Host "  Total in table:      $totalConv"
+    Write-Host ""
+}
+
+# ===================================================================
 # MAIN LOOP
 # ===================================================================
 Connect-ToGraph
@@ -545,6 +692,8 @@ while ($running) {
         "1" { Invoke-Sync -Mode "full" }
         "2" { Invoke-Sync -Mode "incremental" }
         "3" { Invoke-DownloadMissingAttachments }
+        "4" { Invoke-BuildConversations -Mode "full" }
+        "5" { Invoke-BuildConversations -Mode "incremental" }
         "Q" { $running = $false }
         "q" { $running = $false }
         default {
